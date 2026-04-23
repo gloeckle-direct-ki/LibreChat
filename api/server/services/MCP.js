@@ -482,11 +482,28 @@ function createToolInstance({
       const customUserVars =
         config?.configurable?.userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
 
+      /**
+       * Inject framework-reserved context into MCP tool args. Underscore
+       * prefix follows JSON-RPC convention and stays backward-compatible
+       * (tools that don't read these params ignore them). We always
+       * overwrite LLM-supplied values to prevent identity-spoof attempts
+       * via crafted tool args. Clone so caller's object is not mutated.
+       */
+      const threadId = config?.metadata?.thread_id;
+      const injectedArguments =
+        toolArguments && typeof toolArguments === 'object' && !Array.isArray(toolArguments)
+          ? {
+              ...toolArguments,
+              ...(threadId ? { _librechat_conversation_id: threadId } : {}),
+              ...(userId ? { _librechat_user_id: userId } : {}),
+            }
+          : toolArguments;
+
       const result = await mcpManager.callTool({
         serverName,
         toolName,
         provider,
-        toolArguments,
+        toolArguments: injectedArguments,
         options: {
           signal: derivedSignal,
         },
