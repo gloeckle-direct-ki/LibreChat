@@ -30,6 +30,7 @@ const { addAgentResourceFile, removeAgentResourceFiles } = require('~/models/Age
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { createFile, updateFileUsage, deleteFiles } = require('~/models');
+const { addPersistentFile } = require('~/models/Conversation');
 const { getFileStrategy } = require('~/server/utils/getFileStrategy');
 const { checkCapability } = require('~/server/services/Config');
 const { LB_QueueAsyncCall } = require('~/server/utils/queue');
@@ -58,6 +59,34 @@ const createSanitizedUploadWrapper = (uploadFunction) => {
 
     return uploadFunction({ req, file: sanitizedFile, file_id, ...restParams });
   };
+};
+
+/**
+ * Best-effort registration of a freshly-created file row in
+ * Conversation.persistent_files. Called by every upload path after the file
+ * is persisted, so primeFiles() can later mount the file in /mnt/data
+ * regardless of whether it was attached as an agent execute_code resource.
+ *
+ * Silent no-op if conversationId or file fields are missing — pre-conversation
+ * uploads and permanent agent-resource uploads both legitimately skip this.
+ * Errors are logged but never thrown: the file itself is already saved.
+ *
+ * @param {string|undefined|null} conversationId
+ * @param {{file_id?: string, filename?: string} | null | undefined} file
+ * @returns {Promise<void>}
+ */
+const tryRegisterPersistentFile = async (conversationId, file) => {
+  if (!conversationId || !file?.file_id || !file?.filename) {
+    return;
+  }
+  try {
+    await addPersistentFile(conversationId, {
+      file_id: file.file_id,
+      filename: file.filename,
+    });
+  } catch (err) {
+    logger.warn(`[process] addPersistentFile failed: ${err.message}`);
+  }
 };
 
 /**
@@ -452,6 +481,7 @@ const processFileUpload = async ({ req, res, metadata }) => {
     },
     true,
   );
+  await tryRegisterPersistentFile(metadata.conversationId, result);
   res.status(200).json({ message: 'File uploaded and processed successfully', ...result });
 };
 
@@ -546,6 +576,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         });
       }
       const result = await createFile(fileInfo, true);
+      await tryRegisterPersistentFile(req.body?.conversationId, result);
       return res
         .status(200)
         .json({ message: 'Agent file uploaded and processed successfully', ...result });
@@ -691,6 +722,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   });
 
   const result = await createFile(fileInfo, true);
+  await tryRegisterPersistentFile(req.body?.conversationId, result);
 
   res.status(200).json({ message: 'Agent file uploaded and processed successfully', ...result });
 };
@@ -1026,4 +1058,5 @@ module.exports = {
   processDeleteRequest,
   processAgentFileUpload,
   retrieveAndProcessFile,
+  tryRegisterPersistentFile,
 };
