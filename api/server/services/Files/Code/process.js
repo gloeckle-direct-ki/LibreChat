@@ -15,6 +15,7 @@ const { filterFilesByAgentAccess } = require('~/server/services/Files/permission
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { convertImage } = require('~/server/services/Files/images/convert');
 const { createFile, getFiles, updateFile } = require('~/models');
+const { Conversation } = require('~/db/models');
 
 /**
  * Process OpenAI image files, convert to target format, save and return file metadata.
@@ -164,9 +165,29 @@ async function getSessionInfo(fileIdentifier, apiKey) {
  */
 const primeFiles = async (options, apiKey) => {
   const { tool_resources, req, agentId } = options;
-  const file_ids = tool_resources?.[EToolResources.execute_code]?.file_ids ?? [];
-  const agentResourceIds = new Set(file_ids);
+  const conversationId = options.conversationId ?? req?.body?.conversationId;
+  const agentResourceFileIds = tool_resources?.[EToolResources.execute_code]?.file_ids ?? [];
+  const agentResourceIds = new Set(agentResourceFileIds);
   const resourceFiles = tool_resources?.[EToolResources.execute_code]?.files ?? [];
+
+  // Pull files registered against this conversation (Vector-B persistence): every
+  // file uploaded into the conversation is recorded in Conversation.persistent_files,
+  // independent of whether it was attached as an execute_code agent resource. Without
+  // this, chat-paperclip uploads were invisible on the next code-interpreter call.
+  let persistentFileIds = [];
+  if (conversationId) {
+    try {
+      const convo = await Conversation.findOne(
+        { conversationId },
+        { persistent_files: 1 },
+      ).lean();
+      persistentFileIds = (convo?.persistent_files ?? []).map((f) => f.file_id);
+    } catch (err) {
+      logger.warn(`[primeFiles] persistent_files lookup failed: ${err.message}`);
+    }
+  }
+
+  const file_ids = [...new Set([...agentResourceFileIds, ...persistentFileIds])];
 
   // Get all files first
   const allFiles = (await getFiles({ file_id: { $in: file_ids } }, null, { text: 0 })) ?? [];
