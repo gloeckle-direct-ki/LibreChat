@@ -34,6 +34,17 @@ const convoSchema: Schema<IConversation> = new Schema(
     files: {
       type: [String],
     },
+    persistent_files: {
+      type: [
+        {
+          file_id: { type: String, required: true },
+          filename: { type: String, required: true },
+          added_at: { type: Date, default: Date.now },
+          _id: false,
+        },
+      ],
+      default: [],
+    },
     expiredAt: {
       type: Date,
     },
