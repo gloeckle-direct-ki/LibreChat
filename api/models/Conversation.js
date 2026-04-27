@@ -75,8 +75,43 @@ const getConvoFiles = async (conversationId) => {
   }
 };
 
+/**
+ * Atomically registers a file in Conversation.persistent_files. Idempotent on
+ * file_id — repeated calls with the same file_id are no-ops, and the first
+ * call's filename is preserved.
+ *
+ * Implemented as a single conditional updateOne ($push gated by a $ne match on
+ * persistent_files.file_id), which avoids the $addToSet sub-document equality
+ * trap (added_at would always differ → no dedup) and is race-safe under
+ * concurrent uploads.
+ *
+ * @param {string} conversationId
+ * @param {{ file_id: string, filename: string }} file
+ * @returns {Promise<import('mongoose').UpdateWriteOpResult>}
+ */
+const addPersistentFile = async (conversationId, { file_id, filename }) => {
+  try {
+    return await Conversation.updateOne(
+      { conversationId, 'persistent_files.file_id': { $ne: file_id } },
+      {
+        $push: {
+          persistent_files: {
+            file_id,
+            filename,
+            added_at: new Date(),
+          },
+        },
+      },
+    );
+  } catch (error) {
+    logger.error('[addPersistentFile] Error registering persistent file', error);
+    throw new Error('Error registering persistent file');
+  }
+};
+
 module.exports = {
   getConvoFiles,
+  addPersistentFile,
   searchConversation,
   deleteNullOrEmptyConversations,
   /**
