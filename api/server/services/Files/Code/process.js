@@ -177,8 +177,11 @@ const primeFiles = async (options, apiKey) => {
   let persistentFileIds = [];
   if (conversationId) {
     try {
+      // user filter is required hygiene — prevents the same class of cross-user
+      // leak that hit OneDrive-MCP (2026-05-04). UUID-v4 collisions are
+      // astronomically unlikely but mongo lookups must scope by owner anyway.
       const convo = await Conversation.findOne(
-        { conversationId },
+        { conversationId, user: req?.user?.id },
         { persistent_files: 1 },
       ).lean();
       persistentFileIds = (convo?.persistent_files ?? []).map((f) => f.file_id);

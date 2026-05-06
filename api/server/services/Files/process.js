@@ -67,8 +67,16 @@ const createSanitizedUploadWrapper = (uploadFunction) => {
  * is persisted, so primeFiles() can later mount the file in /mnt/data
  * regardless of whether it was attached as an agent execute_code resource.
  *
- * Silent no-op if conversationId or file fields are missing — pre-conversation
- * uploads and permanent agent-resource uploads both legitimately skip this.
+ * NOTE — Latent hook (LibreChat v0.8.2): this function is reached on every
+ * upload but `metadata.conversationId` / `req.body.conversationId` is always
+ * empty in practice — the LibreChat frontend's multipart upload body omits
+ * conversationId. The actual registration therefore happens in saveConvo via
+ * registerFilesAsPersistent(). This hook is kept as a forward-compat seam:
+ * if/when LibreChat starts sending conversationId on uploads (e.g. via a
+ * client patch in Phase 2/3), registration will start firing here as well —
+ * which is harmless because addPersistentFile is idempotent.
+ *
+ * Silent no-op if conversationId or file fields are missing.
  * Errors are logged but never thrown: the file itself is already saved.
  *
  * @param {string|undefined|null} conversationId

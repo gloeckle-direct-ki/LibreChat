@@ -134,9 +134,27 @@ const registerFilesAsPersistent = async (conversationId, fileIds) => {
     return;
   }
   try {
+    // Pre-fetch the file_ids already registered to short-circuit on the
+    // steady-state path. saveConvo runs every turn with the full files[]
+    // array, so without this each long conversation pays N+1 mongo round-trips
+    // every turn (1× File.find + N× addPersistentFile-no-op). With the diff
+    // fetch, the steady state is 1 query (the existing-set lookup); only
+    // genuinely new files trigger File.find + addPersistentFile loops.
+    const existing = await Conversation.findOne(
+      { conversationId },
+      { 'persistent_files.file_id': 1 },
+    ).lean();
+    const existingIds = new Set(
+      (existing?.persistent_files ?? []).map((f) => f.file_id),
+    );
+    const newIds = fileIds.filter((id) => !existingIds.has(id));
+    if (newIds.length === 0) {
+      return;
+    }
+
     const File = mongoose.model('File');
     const fileDocs = await File.find(
-      { file_id: { $in: fileIds } },
+      { file_id: { $in: newIds } },
       { file_id: 1, filename: 1 },
     ).lean();
     for (const fileDoc of fileDocs) {

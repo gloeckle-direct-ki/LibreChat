@@ -106,4 +106,59 @@ describe('registerFilesAsPersistent', () => {
     const c = await Conversation.findOne({ conversationId: 'c6' }).lean();
     expect(c.persistent_files ?? []).toHaveLength(0);
   });
+
+  it('does not re-fetch File rows when all fileIds are already registered (steady-state)', async () => {
+    // Steady-state idempotency check — each saveConvo on a long conversation
+    // re-runs registerFilesAsPersistent with the full files[] array. Without
+    // an early-return, that's N+1 queries every turn. The pre-fetch of
+    // existing file_ids should short-circuit before we touch File.find.
+    await Conversation.create({
+      conversationId: 'c-steady',
+      user: 'u1',
+      endpoint: 'openAI',
+      persistent_files: [
+        { file_id: 'f1', filename: 'a.pdf', added_at: new Date() },
+        { file_id: 'f2', filename: 'b.pdf', added_at: new Date() },
+      ],
+    });
+    await seedFile('f1', 'a.pdf');
+    await seedFile('f2', 'b.pdf');
+
+    const findSpy = jest.spyOn(File, 'find');
+    try {
+      await registerFilesAsPersistent('c-steady', ['f1', 'f2']);
+      expect(findSpy).not.toHaveBeenCalled();
+      const c = await Conversation.findOne({ conversationId: 'c-steady' }).lean();
+      expect(c.persistent_files).toHaveLength(2);
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  it('fetches File rows only for newly-added file_ids', async () => {
+    await Conversation.create({
+      conversationId: 'c-mixed',
+      user: 'u1',
+      endpoint: 'openAI',
+      persistent_files: [
+        { file_id: 'f1', filename: 'a.pdf', added_at: new Date() },
+      ],
+    });
+    await seedFile('f1', 'a.pdf');
+    await seedFile('f2', 'b.pdf');
+
+    const findSpy = jest.spyOn(File, 'find');
+    try {
+      await registerFilesAsPersistent('c-mixed', ['f1', 'f2']);
+      expect(findSpy).toHaveBeenCalledTimes(1);
+      const queryArg = findSpy.mock.calls[0][0];
+      // Should query only for f2 (the new one), not f1 (already there)
+      expect(queryArg.file_id.$in).toEqual(['f2']);
+    } finally {
+      findSpy.mockRestore();
+    }
+
+    const c = await Conversation.findOne({ conversationId: 'c-mixed' }).lean();
+    expect(c.persistent_files).toHaveLength(2);
+  });
 });

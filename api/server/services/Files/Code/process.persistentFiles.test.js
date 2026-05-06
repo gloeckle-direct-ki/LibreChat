@@ -63,7 +63,7 @@ describe('primeFiles — unions Conversation.persistent_files with agent resourc
   it('includes files from persistent_files when no agent execute_code resource is present', async () => {
     await Conversation.create({
       conversationId: 'c1',
-      user: 'u1',
+      user: userId.toString(),
       endpoint: 'openAI',
       persistent_files: [
         { file_id: 'fp1', filename: 'a.pdf', added_at: new Date() },
@@ -83,14 +83,16 @@ describe('primeFiles — unions Conversation.persistent_files with agent resourc
     expect(files[0].name).toBe('a.pdf');
     expect(files[0].session_id).toBe('session-A');
     expect(toolContext).toContain('/mnt/data/a.pdf');
-    // No '(just attached by user)' marker — file came via persistent_files
+    // Marker present — file came via persistent_files (not as agent execute_code
+    // resource), so primeFiles flags it with "(just attached by user)" so the LLM
+    // distinguishes user-attached files from permanent agent resources.
     expect(toolContext).toContain('/mnt/data/a.pdf (just attached by user)');
   });
 
   it('deduplicates when the same file_id is in both persistent_files and agent execute_code resources', async () => {
     await Conversation.create({
       conversationId: 'c2',
-      user: 'u1',
+      user: userId.toString(),
       endpoint: 'openAI',
       persistent_files: [
         { file_id: 'fdup', filename: 'b.pdf', added_at: new Date() },
@@ -126,7 +128,7 @@ describe('primeFiles — unions Conversation.persistent_files with agent resourc
   it('marks agent-resource files without the (just attached by user) hint, persistent-only files with it', async () => {
     await Conversation.create({
       conversationId: 'c3',
-      user: 'u1',
+      user: userId.toString(),
       endpoint: 'openAI',
       persistent_files: [
         { file_id: 'fp', filename: 'paper.pdf', added_at: new Date() },
@@ -146,5 +148,32 @@ describe('primeFiles — unions Conversation.persistent_files with agent resourc
     expect(toolContext).toContain('/mnt/data/attached.pdf');
     expect(toolContext).not.toMatch(/\/mnt\/data\/attached\.pdf \(just attached by user\)/);
     expect(toolContext).toContain('/mnt/data/paper.pdf (just attached by user)');
+  });
+
+  it('does NOT leak persistent_files across users (security hygiene)', async () => {
+    // Belt-and-suspenders: UUID-v4 collision is astronomically unlikely, but
+    // primeFiles' Conversation.findOne must include a user filter to prevent
+    // the same class of bug that caused the OneDrive cross-user-leak (2026-05-04).
+    const otherUserId = new mongoose.Types.ObjectId();
+    await Conversation.create({
+      conversationId: 'shared-uuid',
+      user: otherUserId.toString(), // belongs to a DIFFERENT user
+      endpoint: 'openAI',
+      persistent_files: [
+        { file_id: 'leak', filename: 'private.pdf', added_at: new Date() },
+      ],
+    });
+    await seedFile({ file_id: 'leak', filename: 'private.pdf', fileIdentifier: 'session-A/file-A' });
+
+    const { files, toolContext } = await primeFiles(
+      {
+        req: { body: { conversationId: 'shared-uuid' }, user: { id: userId.toString() } },
+        tool_resources: {},
+      },
+      'fake-api-key',
+    );
+
+    expect(files).toHaveLength(0);
+    expect(toolContext).toBe('');
   });
 });
