@@ -30,6 +30,7 @@ const {
 } = require('./ActionService');
 const { processFileURL, uploadImageBuffer } = require('~/server/services/Files/process');
 const { buildInlineFileBlock } = require('~/server/services/Files/inlineContext');
+const { prefillMountFileIds } = require('~/server/services/Files/mountContext');
 const { getEndpointsConfig, getCachedTools } = require('~/server/services/Config');
 const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
@@ -445,6 +446,17 @@ async function loadAgentTools({
     });
   }
 
+  // Phase 3 Task 6 — prefill tool_resources.execute_code.file_ids with
+  // persistent_files (Vector A) before the tool loader (and primeFiles)
+  // runs. Belt-and-suspenders for any code that inspects tool_resources
+  // upstream of primeFiles. Idempotent: primeFiles dedups again. Track 2's
+  // session_files are unioned downstream by primeFiles itself.
+  const prefilledToolResources = await prefillMountFileIds(
+    req,
+    req?.body?.conversationId,
+    tool_resources,
+  );
+
   const { loadedTools, toolContextMap } = await loadTools({
     agent,
     signal,
@@ -456,7 +468,7 @@ async function loadAgentTools({
       req,
       res,
       openAIApiKey,
-      tool_resources,
+      tool_resources: prefilledToolResources,
       processFileURL,
       uploadImageBuffer,
       returnMetadata: true,
