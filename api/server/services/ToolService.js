@@ -29,6 +29,7 @@ const {
   domainParser,
 } = require('./ActionService');
 const { processFileURL, uploadImageBuffer } = require('~/server/services/Files/process');
+const { buildInlineFileBlock } = require('~/server/services/Files/inlineContext');
 const { getEndpointsConfig, getCachedTools } = require('~/server/services/Config');
 const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
@@ -465,6 +466,15 @@ async function loadAgentTools({
     fileStrategy: appConfig.fileStrategy,
     imageOutputType: appConfig.imageOutputType,
   });
+
+  // Phase 3 Task 5 — inject inline-extracted file content into the system
+  // message via toolContextMap. run.ts joins all toolContextMap values into
+  // the system prompt; an extra non-tool key rides along that join cleanly.
+  // No-op when there are no inline-loaded files for this conversation.
+  const inlineBlock = await buildInlineFileBlock(req, req?.body?.conversationId);
+  if (inlineBlock) {
+    toolContextMap.__inline_files = inlineBlock;
+  }
 
   const agentTools = [];
   for (let i = 0; i < loadedTools.length; i++) {
