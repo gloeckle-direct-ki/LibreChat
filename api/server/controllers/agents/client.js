@@ -44,7 +44,7 @@ const {
 const { spendTokens, spendStructuredTokens } = require('~/models/spendTokens');
 const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { createContextHandlers } = require('~/app/clients/prompts');
-const { getConvoFiles } = require('~/models/Conversation');
+const { getConvoFiles, addPersistentFile } = require('~/models/Conversation');
 const BaseClient = require('~/app/clients/BaseClient');
 const { getRoleByName } = require('~/models/Role');
 const { loadAgent } = require('~/models/Agent');
@@ -398,6 +398,33 @@ class AgentClient extends BaseClient {
     if (this.options.attachments) {
       const attachments = await this.options.attachments;
       const latestMessage = orderedMessages[orderedMessages.length - 1];
+
+      // Phase-3 follow-up (Track-2 race fix): register message-attachments into
+      // Conversation.persistent_files BEFORE agent execution. Phase-1.5's
+      // registerFilesAsPersistent fires from saveConvo, which runs AFTER the
+      // agent completes — so within-message multi-/exec calls (e.g., agent
+      // does `unzip` then a follow-up Python read) all see an empty
+      // persistent_files because LibreChat's per-message file-attachment
+      // forwarding only attaches to the FIRST tool call. Closes the
+      // Sascha T-34 within-message race. Idempotent: addPersistentFile uses
+      // an $ne-conditional $push, so saveConvo's later call is a no-op for
+      // already-registered file_ids.
+      if (this.conversationId && Array.isArray(attachments)) {
+        for (const att of attachments) {
+          if (att?.file_id && att?.filename) {
+            try {
+              await addPersistentFile(this.conversationId, {
+                file_id: att.file_id,
+                filename: att.filename,
+              });
+            } catch (err) {
+              logger.warn(
+                `[buildMessages] addPersistentFile early-register failed for ${att.file_id}: ${err && err.message}`,
+              );
+            }
+          }
+        }
+      }
 
       if (this.message_file_map) {
         this.message_file_map[latestMessage.messageId] = attachments;
