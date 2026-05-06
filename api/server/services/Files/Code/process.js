@@ -16,6 +16,7 @@ const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { convertImage } = require('~/server/services/Files/images/convert');
 const { createFile, getFiles, updateFile } = require('~/models');
 const { Conversation } = require('~/db/models');
+const { registerSessionFile } = require('~/models/Conversation');
 
 /**
  * Process OpenAI image files, convert to target format, save and return file metadata.
@@ -39,6 +40,22 @@ const processCodeOutput = async ({
   messageId,
   session_id,
 }) => {
+  // Track 2 — register every exec-output (image AND non-image) in
+  // Conversation.session_files so primeFiles can forward it to subsequent
+  // /exec calls. Non-image files have no db.files row (createFile is only
+  // called below for images); session_files is the ONLY trace of them.
+  if (conversationId && session_id && id && name) {
+    try {
+      await registerSessionFile(conversationId, {
+        session_id,
+        file_id: id,
+        filename: name,
+      });
+    } catch (err) {
+      logger.warn(`[processCodeOutput] registerSessionFile failed: ${err.message}`);
+    }
+  }
+
   const appConfig = req.config;
   const currentDate = new Date();
   const baseURL = getCodeBaseURL();
