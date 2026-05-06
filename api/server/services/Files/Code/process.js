@@ -44,9 +44,12 @@ const processCodeOutput = async ({
   // Conversation.session_files so primeFiles can forward it to subsequent
   // /exec calls. Non-image files have no db.files row (createFile is only
   // called below for images); session_files is the ONLY trace of them.
-  if (conversationId && session_id && id && name) {
+  // Scoped by req.user.id to prevent cross-user injection — Conversation.updateOne
+  // matches conversationId + user pair, so a wrong-user conversationId is a no-op.
+  const userId = req?.user?.id;
+  if (conversationId && session_id && id && name && userId) {
     try {
-      await registerSessionFile(conversationId, {
+      await registerSessionFile(conversationId, userId, {
         session_id,
         file_id: id,
         filename: name,

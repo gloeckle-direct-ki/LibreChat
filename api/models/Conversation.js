@@ -185,18 +185,26 @@ const registerFilesAsPersistent = async (conversationId, fileIds) => {
  * files (with db.files rows), session_files tracks exec-generated files
  * (no db.files row required — they live in code-interpreter's session FS).
  *
+ * Scoped by `user` to prevent cross-user injection: a request carrying another
+ * user's conversationId must not be able to push session_files entries onto
+ * the victim's conversation. matchedCount stays 0 if user/conversationId pair
+ * does not exist.
+ *
  * @param {string} conversationId
+ * @param {string} userId — owner of the conversation (req.user.id at the call site)
  * @param {{ session_id: string, file_id: string, filename: string }} entry
  * @returns {Promise<import('mongoose').UpdateWriteOpResult>}
  */
 const registerSessionFile = async (
   conversationId,
+  userId,
   { session_id, file_id, filename },
 ) => {
   try {
     return await Conversation.updateOne(
       {
         conversationId,
+        user: userId,
         session_files: { $not: { $elemMatch: { session_id, file_id } } },
       },
       {
