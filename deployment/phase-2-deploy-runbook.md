@@ -34,27 +34,60 @@ liegen unter `deployment/patches/phase-2/`. Phase 2 ist komplett
 # WSL host:
 cd /home/elsner/LibreChat-fork-phase-2
 ls deployment/patches/phase-2/
-# Stages 1-3 als 0001-0003, Stage 4 (docs) als 0004, Codex-polish als 0005-0007.
-# Apply in order — siehe "Format-Patches-Verzeichnis" unten.
+# Apply-Reihenfolge ist die lexikografische — siehe "Format-Patches-Verzeichnis" unten.
 
-scp deployment/patches/phase-2/*.patch slx-ki-webapp.gloeckle.local:/tmp/
+# Dedizierter Temp-Dir auf prod, frisch geleert. Verhindert dass eine fremde
+# /tmp/0*.patch-Datei aus einer früheren Iteration mit-applied wird (codex R2).
+ssh slx-ki-webapp.gloeckle.local 'mkdir -p /tmp/phase-2-patches && rm -f /tmp/phase-2-patches/*.patch'
+scp deployment/patches/phase-2/*.patch slx-ki-webapp.gloeckle.local:/tmp/phase-2-patches/
 ```
 
 ---
 
 ## Stage 2 — Hand-Apply auf prod
 
+Der SSH-Block ist als Heredoc mit `set -euo pipefail` strukturiert: ein
+gescheiterter `git apply --check` oder `git apply` bricht den ganzen Block
+sofort ab (codex R1) — sonst würde ein verschluckter Konflikt im 3.
+Patch in den 4. kaskadieren und am Ende blind den `git stash pop`
+triggern. Bei Abbruch bleibt die Stash bewusst erhalten: das
+`trap`-Handler-Echo zeigt wie sie nach Hand-Merge zurückgeholt wird.
+
 ```bash
-ssh slx-ki-webapp.gloeckle.local
+ssh slx-ki-webapp.gloeckle.local <<'REMOTE'
+set -euo pipefail
 cd ~/LibreChat
+
+# Bei jedem nicht-Null-Exit (apply check fail, apply fail, pop merge-konflikt)
+# eine klare Recovery-Anleitung loggen statt stillschweigend zu enden.
+trap 'rc=$?; if [ $rc -ne 0 ]; then
+  echo "[ABORT] phase-2 deploy aborted (exit $rc)."
+  echo "  stash bleibt erhalten: \"git stash list | grep phase-2-deploy-stash\""
+  echo "  recovery: STASH_REF=\$(git stash list | grep phase-2-deploy-stash | head -1 | cut -d: -f1)"
+  echo "           git stash pop \"\$STASH_REF\""
+fi' EXIT
+
 git status -s    # snapshot der bestehenden customizations
 git stash --include-untracked --message "phase-2-deploy-stash"
 
 # 3-way merge — fängt Konflikte ab statt blind zu überschreiben.
-for p in /tmp/0*-*.patch; do
+# Glob ist auf den dedizierten Temp-Dir aus Stage 1 gescoped (codex R2).
+for p in /tmp/phase-2-patches/0*-*.patch; do
+  echo "[apply] $p"
   git apply --3way --check "$p"
   git apply --3way        "$p"
 done
+echo "[OK] all patches applied"
+
+# Nur erreicht wenn alle Patches sauber durch sind — set -e hat oben sonst
+# abgebrochen. Stash-Pop kann immer noch auf prod-customizations konfligen;
+# der trap-Handler oben gibt im Fall die Recovery-Schritte aus.
+STASH_REF=$(git stash list | grep phase-2-deploy-stash | head -1 | cut -d: -f1)
+if [ -n "$STASH_REF" ]; then
+  echo "[stash-pop] $STASH_REF"
+  git stash pop "$STASH_REF"
+fi
+REMOTE
 ```
 
 **Wahrscheinliche Konfliktstellen** (Phase-3-deploy hat das genauso
@@ -70,19 +103,12 @@ gesehen):
 3. `client/src/style.css` — append-only am Dateiende, sauber.
 4. `api/server/routes/files/index.js` — append-only, sauber.
 
-```bash
-# Nach erfolgreichem Apply: Stash wieder zurückholen.
-# WICHTIG: `git stash pop "phase-2-deploy-stash"` ist KEIN gültiger Stash-Ref —
-# git stash erwartet stash@{N}. Über die Message muss erst der Index gefunden
-# werden, oder direkt `stash@{0}` wenn nichts dazwischen gestashed wurde.
-STASH_REF=$(git stash list | grep "phase-2-deploy-stash" | head -1 | cut -d: -f1)
-if [ -n "$STASH_REF" ]; then
-  git stash pop "$STASH_REF"
-else
-  echo "phase-2-deploy-stash nicht gefunden — git stash list manuell prüfen."
-fi
-# → ggf. nochmal mergen falls Konflikte
-```
+> **Stash-Recovery on Konflikt:** Wenn das `git stash pop "$STASH_REF"`
+> oben mit Merge-Konflikten failt, bricht der Heredoc ab und der
+> trap-Handler druckt die Recovery-Anweisung. Working-Tree ist dann in
+> "stash applied with conflicts"-Zustand: `git status` zeigt unmerged
+> Files, normaler 3-way-merge per Editor, dann `git add` + `git
+> stash drop` für die noch verbliebene Stash-Eintrag.
 
 ---
 
@@ -154,15 +180,20 @@ npm run frontend
 # Backend SSE-Routen bleiben aktiv aber niemand verbindet sich mehr.
 ```
 
-### Option B — Voll-Rollback (alle 3 Patches)
+### Option B — Voll-Rollback (alle Patches)
 
 ```bash
-for p in $(ls /tmp/0*-*.patch | sort -r); do
+ssh slx-ki-webapp.gloeckle.local <<'REMOTE'
+set -euo pipefail
+cd ~/LibreChat
+for p in $(ls /tmp/phase-2-patches/0*-*.patch | sort -r); do
+  echo "[reverse] $p"
   git apply --reverse "$p"
 done
 npm run build:packages
 npm run frontend
 pm2 restart librechat-api
+REMOTE
 ```
 
 Bei Konflikten: `git checkout HEAD -- <file>` der konfliktiven Files
@@ -220,7 +251,9 @@ Phase-3-Baseline `973969e`, gruppiert nach Iteration:
 
 Apply in **lexicographic order** — sie sind nicht kommutativ (Stage 2
 referenziert Stage-1-Imports; Stage 3 patcht Stage-2-Files). Glob
-`/tmp/0*-*.patch` in einer For-Loop ist die idiomatische Form.
+`/tmp/phase-2-patches/0*-*.patch` in einer For-Loop ist die idiomatische
+Form (dedizierter Temp-Dir verhindert dass eine fremde Patch-Datei
+aus `/tmp/` mit-applied wird — codex R2).
 
 ```bash
 ls deployment/patches/phase-2/        # aktuelle Patch-Liste
