@@ -14,6 +14,7 @@ const files = require('./files');
 const images = require('./images');
 const avatar = require('./avatar');
 const speech = require('./speech');
+const { statusStreamHandler } = require('./statusStream');
 
 const initialize = async () => {
   const router = express.Router();
@@ -27,6 +28,10 @@ const initialize = async () => {
 
   /* Important: speech route must be added before the upload limiters */
   router.use('/speech', speech);
+
+  /* Phase 2 — SSE channel for live file-status / session_file updates.
+     Long-lived GET; sits before the POST-only upload rate-limiters. */
+  router.get('/status-stream', statusStreamHandler);
 
   const { fileUploadIpLimiter, fileUploadUserLimiter } = createFileLimiters();
 
