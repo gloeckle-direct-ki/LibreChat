@@ -214,4 +214,87 @@ describe('useFileStatusStream', () => {
     expect(result.current.pathStatusByFileId).toEqual({});
     expect(result.current.sessionFiles).toEqual([]);
   });
+
+  // Codex review F2 — stale state across conversations.
+  describe('state reset on subscription change', () => {
+    it('clears pathStatusByFileId when conversationId changes', () => {
+      const { result, rerender } = renderHook(
+        ({ cid }) => useFileStatusStream({ enabled: true, conversationId: cid }),
+        { initialProps: { cid: 'c1' } },
+      );
+
+      act(() => {
+        sseInstances[0].dispatch('status', {
+          file_id: 'f1',
+          path: 'inline',
+          state: 'loaded',
+          chars: 50,
+        });
+      });
+      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
+
+      rerender({ cid: 'c2' });
+
+      expect(result.current.pathStatusByFileId).toEqual({});
+    });
+
+    it('clears live sessionFiles when conversationId changes', () => {
+      const { result, rerender } = renderHook(
+        ({ cid }) => useFileStatusStream({ enabled: true, conversationId: cid }),
+        { initialProps: { cid: 'c1' } },
+      );
+
+      act(() => {
+        sseInstances[0].dispatch('session_file', {
+          session_file: { session_id: 'A', file_id: 'sf-1', filename: 'old.csv' },
+        });
+      });
+      expect(result.current.sessionFiles).toHaveLength(1);
+
+      rerender({ cid: 'c2' });
+
+      expect(result.current.sessionFiles).toEqual([]);
+    });
+
+    it('resets state when token changes (logout / re-login on same browser)', () => {
+      const { result, rerender } = renderHook(() =>
+        useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+      );
+
+      act(() => {
+        sseInstances[0].dispatch('status', {
+          file_id: 'f1',
+          path: 'rag',
+          state: 'embedded',
+          chunks: 3,
+        });
+      });
+      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
+
+      mockToken = 'tok-new-user';
+      rerender();
+
+      expect(result.current.pathStatusByFileId).toEqual({});
+    });
+
+    it('does not reset state when none of the deps changed (re-render no-op)', () => {
+      const { result, rerender } = renderHook(() =>
+        useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+      );
+
+      act(() => {
+        sseInstances[0].dispatch('status', {
+          file_id: 'f1',
+          path: 'inline',
+          state: 'loaded',
+          chars: 10,
+        });
+      });
+      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
+
+      rerender();
+
+      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
+    });
+  });
 });

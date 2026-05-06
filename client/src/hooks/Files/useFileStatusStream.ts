@@ -66,6 +66,14 @@ export default function useFileStatusStream({
   const sseRef = useRef<SSE | null>(null);
 
   useEffect(() => {
+    // Fresh connection = fresh state. Prevents chips from one conversation
+    // (or one logged-in user) bleeding into the next when this hook stays
+    // mounted across navigation (codex review F2). React bails out of
+    // re-renders when setState is called with the same empty-shape value,
+    // so the no-op case (initial mount) is free.
+    setPathStatusByFileId({});
+    setLiveSessionFiles([]);
+
     if (!enabled || !isAuthenticated || !token) return;
 
     const url = conversationId

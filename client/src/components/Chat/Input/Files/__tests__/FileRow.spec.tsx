@@ -326,6 +326,46 @@ describe('FileRow', () => {
     });
   });
 
+  describe('Codex review F5: SSE active on conversationId only', () => {
+    const useStreamMock = jest.requireMock('~/hooks/Files').useFileStatusStream;
+    const useChatCtxMock = jest.requireMock('~/Providers').useChatContext;
+
+    beforeEach(() => {
+      useStreamMock.mockClear();
+      useStreamMock.mockReturnValue({ pathStatusByFileId: {}, sessionFiles: [] });
+    });
+
+    it('opens the SSE stream as soon as a conversationId is set, even with empty files map', () => {
+      useChatCtxMock.mockReturnValue({ conversation: { conversationId: 'c-empty' } });
+      renderFileRow(new Map());
+      expect(useStreamMock).toHaveBeenCalledWith(
+        expect.objectContaining({ enabled: true, conversationId: 'c-empty' }),
+      );
+    });
+
+    it('opens the stream for a conversation with no initialSessionFiles either', () => {
+      useChatCtxMock.mockReturnValue({
+        conversation: { conversationId: 'c-1', session_files: [] },
+      });
+      renderFileRow(new Map());
+      expect(useStreamMock).toHaveBeenCalledWith(
+        expect.objectContaining({ enabled: true, conversationId: 'c-1' }),
+      );
+    });
+
+    it('keeps the stream disabled when there is no conversationId at all', () => {
+      useChatCtxMock.mockReturnValue({ conversation: null });
+      const file = createMockFile();
+      const filesMap = new Map<string, ExtendedFile>();
+      filesMap.set(file.file_id, file);
+
+      renderFileRow(filesMap);
+      expect(useStreamMock).toHaveBeenCalledWith(
+        expect.objectContaining({ enabled: false, conversationId: null }),
+      );
+    });
+  });
+
   describe('Regression: Blob URL Bug Fix', () => {
     it('should NOT use revoked blob URL after upload completes', () => {
       const file = createMockFile({

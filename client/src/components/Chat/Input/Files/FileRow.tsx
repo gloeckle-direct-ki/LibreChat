@@ -47,11 +47,13 @@ export default function FileRow({
     fileFilter ? fileFilter(file) : true,
   );
 
-  // Phase 2 — single SSE subscription per FileRow. Enabled when we have a
-  // conversation context (so server can scope events) and either uploaded
-  // files OR pre-existing session_files to track.
+  // Phase 2 — single SSE subscription per FileRow. Enabled as soon as a
+  // conversation context exists (codex review F5). Gating on files.length /
+  // initialSessionFiles.length would miss the FIRST session_file event for
+  // a code-interpreter run that produces output before any user upload —
+  // breaking UAT S7 live behavior.
   const { pathStatusByFileId, sessionFiles } = useFileStatusStream({
-    enabled: Boolean(conversationId) && (files.length > 0 || initialSessionFiles.length > 0),
+    enabled: Boolean(conversationId),
     conversationId,
     initialSessionFiles,
   });
