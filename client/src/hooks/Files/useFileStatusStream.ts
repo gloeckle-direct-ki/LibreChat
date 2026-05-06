@@ -73,18 +73,20 @@ export default function useFileStatusStream({
   // even before the effect's reset has flushed.
   //
   // codex polish-iter-3: BOTH sides of the comparison must use the same
-  // normalization. The effect writes `?? null` (line below); the render
-  // gate must do the same, otherwise `null === undefined` for callers
+  // normalization (`?? null`), otherwise `null === undefined` for callers
   // that pass no conversationId would keep `scopeMatches` permanently
   // false and silently swallow every status / session_file event.
-  const scopeRef = useRef<{ conversationId: string | null; token: string | null }>(
-    { conversationId: null, token: null },
-  );
-  const normalizedConversationId = conversationId ?? null;
-  const normalizedToken = token ?? null;
+  // codex polish-iter-4: inlined at both sites instead of via named
+  // intermediate vars — keeps `useEffect` deps on the raw `conversationId`
+  // and `token` (intentional, so undefined → null still re-opens the
+  // stream) without tripping `react-hooks/exhaustive-deps`.
+  const scopeRef = useRef<{ conversationId: string | null; token: string | null }>({
+    conversationId: null,
+    token: null,
+  });
   const scopeMatches =
-    scopeRef.current.conversationId === normalizedConversationId &&
-    scopeRef.current.token === normalizedToken;
+    scopeRef.current.conversationId === (conversationId ?? null) &&
+    scopeRef.current.token === (token ?? null);
 
   useEffect(() => {
     // Fresh connection = fresh state. Prevents chips from one conversation
@@ -95,7 +97,7 @@ export default function useFileStatusStream({
     // (post-reset) is what flips `scopeMatches` true on the next render.
     setPathStatusByFileId({});
     setLiveSessionFiles([]);
-    scopeRef.current = { conversationId: normalizedConversationId, token: normalizedToken };
+    scopeRef.current = { conversationId: conversationId ?? null, token: token ?? null };
 
     if (!enabled || !isAuthenticated || !token) return;
 
@@ -112,8 +114,6 @@ export default function useFileStatusStream({
       sseRef.current = sse;
     } catch (err) {
       // sse.js constructor failures (CSP, blocked etc.) — swallow, no live UX.
-      // Logged via the data-provider logger if available; otherwise just bail.
-      // eslint-disable-next-line no-console
       console.warn('[useFileStatusStream] failed to open SSE:', err);
       return;
     }

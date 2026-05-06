@@ -16,19 +16,24 @@ class MockSSE {
     this.options = options;
     sseInstances.push(this);
   }
+
   addEventListener(name: string, cb: (e: any) => void) {
     if (!this.listeners[name]) this.listeners[name] = [];
     this.listeners[name].push(cb);
   }
+
   removeEventListener(name: string, cb: (e: any) => void) {
     this.listeners[name] = (this.listeners[name] ?? []).filter((l) => l !== cb);
   }
+
   stream() {
     this.streamCalled = true;
   }
+
   close() {
     this.closed = true;
   }
+
   dispatch(name: string, data: unknown) {
     (this.listeners[name] ?? []).forEach((cb) => cb({ data: JSON.stringify(data) }));
   }
@@ -54,9 +59,7 @@ describe('useFileStatusStream', () => {
   });
 
   it('opens an SSE connection with bearer token when enabled', () => {
-    renderHook(() =>
-      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
-    );
+    renderHook(() => useFileStatusStream({ enabled: true, conversationId: 'c1' }));
     expect(sseInstances).toHaveLength(1);
     expect(sseInstances[0].url).toBe('/api/files/status-stream?conversationId=c1');
     expect(sseInstances[0].options.headers.Authorization).toBe('Bearer tok-abc');
@@ -154,9 +157,7 @@ describe('useFileStatusStream', () => {
       useFileStatusStream({
         enabled: true,
         conversationId: 'c1',
-        initialSessionFiles: [
-          { session_id: 'old', file_id: 'fOld', filename: 'old.csv' },
-        ],
+        initialSessionFiles: [{ session_id: 'old', file_id: 'fOld', filename: 'old.csv' }],
       }),
     );
 
