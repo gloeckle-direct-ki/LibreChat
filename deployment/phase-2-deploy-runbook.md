@@ -51,7 +51,7 @@ git status -s    # snapshot der bestehenden customizations
 git stash --include-untracked --message "phase-2-deploy-stash"
 
 # 3-way merge — fängt Konflikte ab statt blind zu überschreiben.
-for p in /tmp/000{1,2,3,4,5,6,7}-*.patch; do
+for p in /tmp/0*-*.patch; do
   git apply --3way --check "$p"
   git apply --3way        "$p"
 done
@@ -157,7 +157,7 @@ npm run frontend
 ### Option B — Voll-Rollback (alle 3 Patches)
 
 ```bash
-for p in /tmp/000{7,6,5,4,3,2,1}-*.patch; do
+for p in $(ls /tmp/0*-*.patch | sort -r); do
   git apply --reverse "$p"
 done
 npm run build:packages
@@ -207,17 +207,21 @@ phase-2-deploy-stash.
 
 ## Format-Patches-Verzeichnis
 
-```
-deployment/patches/phase-2/
-├── 0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch  # Stage 1: SSE bus + route
-├── 0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch  # Stage 2: chips + hook + integration
-├── 0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch   # Stage 3: pipeline emits + CSS
-├── 0004-docs-phase-2-UAT-playbook-deploy-runbook-format-patc.patch  # Stage 4: docs (will be partly self-modifying — that's expected)
-├── 0005-fix-files-SSE-heartbeat-emit-after-persist-codex-rev.patch  # Polish-iter-1: F1 + F3 + F4
-├── 0006-fix-files-reset-hook-state-on-convo-change-activate-.patch  # Polish-iter-1: F2 + F5
-└── 0007-docs-phase-2-correct-stash-pop-ref-in-deploy-runbook.patch  # Polish-iter-1: F6
-```
+`deployment/patches/phase-2/` enthält die `git format-patch`-Outputs off
+Phase-3-Baseline `973969e`, gruppiert nach Iteration:
 
-Each patch is self-contained git format-patch off Phase-3 baseline `973969e`.
-Apply in order — they are not commutative (Stage 2 references Stage 1's
-imports; Stage 3 patches files Stage 2 created).
+- **Stage 1-3 (`0001-0003`):** Feature-Code (SSE-Bus + Route, Chips +
+  Hook, Pipeline-Emit + CSS).
+- **Stage 4 (`0004`):** Initiale Docs (UAT, Runbook, User-Comm). Ein
+  kleiner Anteil dieses Patches modifiziert `deployment/`-Files, die
+  später durch nachfolgende Patches überschrieben werden — das ist
+  normal für format-patch-Sequenzen und harmlos.
+- **Polish-iter-1 (`0005-0007+`):** Codex-Review-Findings F1–F6.
+
+Apply in **lexicographic order** — sie sind nicht kommutativ (Stage 2
+referenziert Stage-1-Imports; Stage 3 patcht Stage-2-Files). Glob
+`/tmp/0*-*.patch` in einer For-Loop ist die idiomatische Form.
+
+```bash
+ls deployment/patches/phase-2/        # aktuelle Patch-Liste
+```
