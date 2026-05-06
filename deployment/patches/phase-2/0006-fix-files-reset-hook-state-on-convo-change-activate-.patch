@@ -1,0 +1,223 @@
+From d86b2a7c3496f7b4446751162806c757bfc718a9 Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Thu, 7 May 2026 00:12:18 +0200
+Subject: [PATCH 6/9] fix(files): reset hook state on convo change + activate
+ SSE on convoId only
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two frontend findings from the codex pass:
+
+- F2 (useFileStatusStream): pathStatusByFileId and liveSessionFiles
+  used to persist across conversationId / token changes when the
+  FileRow stayed mounted, so chips from one conversation could bleed
+  into the next (or one user into another after re-login on the same
+  browser). Fix: reset both maps inside the SSE useEffect so a fresh
+  connection starts from a fresh state. React bails out of no-op
+  re-renders on empty-shape sets, so initial mount is free.
+- F5 (FileRow): the SSE stream was gated on
+  files.length > 0 || initialSessionFiles.length > 0, which prevented
+  the FIRST session_file event from ever arriving for a code-
+  interpreter run that produced output before any user upload —
+  breaking UAT S7's live behavior. Fix: enable on Boolean(conversationId)
+  alone. The early-return when both lists are empty still hides the
+  empty UI; the hook itself stays alive and ready.
+
+Tests: 4 state-reset cases (convoId×2, token, no-op) + 3 enable-
+condition cases (empty files w/ convoId, empty initialSessionFiles,
+no convoId at all). Existing 27 tests unchanged.
+---
+ .../components/Chat/Input/Files/FileRow.tsx   | 10 ++-
+ .../Input/Files/__tests__/FileRow.spec.tsx    | 40 +++++++++
+ .../hooks/Files/useFileStatusStream.spec.tsx  | 83 +++++++++++++++++++
+ client/src/hooks/Files/useFileStatusStream.ts |  8 ++
+ 4 files changed, 137 insertions(+), 4 deletions(-)
+
+diff --git a/client/src/components/Chat/Input/Files/FileRow.tsx b/client/src/components/Chat/Input/Files/FileRow.tsx
+index 5b5e4bb..b40f135 100644
+--- a/client/src/components/Chat/Input/Files/FileRow.tsx
++++ b/client/src/components/Chat/Input/Files/FileRow.tsx
+@@ -47,11 +47,13 @@ export default function FileRow({
+     fileFilter ? fileFilter(file) : true,
+   );
+ 
+-  // Phase 2 — single SSE subscription per FileRow. Enabled when we have a
+-  // conversation context (so server can scope events) and either uploaded
+-  // files OR pre-existing session_files to track.
++  // Phase 2 — single SSE subscription per FileRow. Enabled as soon as a
++  // conversation context exists (codex review F5). Gating on files.length /
++  // initialSessionFiles.length would miss the FIRST session_file event for
++  // a code-interpreter run that produces output before any user upload —
++  // breaking UAT S7 live behavior.
+   const { pathStatusByFileId, sessionFiles } = useFileStatusStream({
+-    enabled: Boolean(conversationId) && (files.length > 0 || initialSessionFiles.length > 0),
++    enabled: Boolean(conversationId),
+     conversationId,
+     initialSessionFiles,
+   });
+diff --git a/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
+index 7cc7a07..1c94a78 100644
+--- a/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
++++ b/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
+@@ -326,6 +326,46 @@ describe('FileRow', () => {
+     });
+   });
+ 
++  describe('Codex review F5: SSE active on conversationId only', () => {
++    const useStreamMock = jest.requireMock('~/hooks/Files').useFileStatusStream;
++    const useChatCtxMock = jest.requireMock('~/Providers').useChatContext;
++
++    beforeEach(() => {
++      useStreamMock.mockClear();
++      useStreamMock.mockReturnValue({ pathStatusByFileId: {}, sessionFiles: [] });
++    });
++
++    it('opens the SSE stream as soon as a conversationId is set, even with empty files map', () => {
++      useChatCtxMock.mockReturnValue({ conversation: { conversationId: 'c-empty' } });
++      renderFileRow(new Map());
++      expect(useStreamMock).toHaveBeenCalledWith(
++        expect.objectContaining({ enabled: true, conversationId: 'c-empty' }),
++      );
++    });
++
++    it('opens the stream for a conversation with no initialSessionFiles either', () => {
++      useChatCtxMock.mockReturnValue({
++        conversation: { conversationId: 'c-1', session_files: [] },
++      });
++      renderFileRow(new Map());
++      expect(useStreamMock).toHaveBeenCalledWith(
++        expect.objectContaining({ enabled: true, conversationId: 'c-1' }),
++      );
++    });
++
++    it('keeps the stream disabled when there is no conversationId at all', () => {
++      useChatCtxMock.mockReturnValue({ conversation: null });
++      const file = createMockFile();
++      const filesMap = new Map<string, ExtendedFile>();
++      filesMap.set(file.file_id, file);
++
++      renderFileRow(filesMap);
++      expect(useStreamMock).toHaveBeenCalledWith(
++        expect.objectContaining({ enabled: false, conversationId: null }),
++      );
++    });
++  });
++
+   describe('Regression: Blob URL Bug Fix', () => {
+     it('should NOT use revoked blob URL after upload completes', () => {
+       const file = createMockFile({
+diff --git a/client/src/hooks/Files/useFileStatusStream.spec.tsx b/client/src/hooks/Files/useFileStatusStream.spec.tsx
+index f53cf9c..993a339 100644
+--- a/client/src/hooks/Files/useFileStatusStream.spec.tsx
++++ b/client/src/hooks/Files/useFileStatusStream.spec.tsx
+@@ -214,4 +214,87 @@ describe('useFileStatusStream', () => {
+     expect(result.current.pathStatusByFileId).toEqual({});
+     expect(result.current.sessionFiles).toEqual([]);
+   });
++
++  // Codex review F2 — stale state across conversations.
++  describe('state reset on subscription change', () => {
++    it('clears pathStatusByFileId when conversationId changes', () => {
++      const { result, rerender } = renderHook(
++        ({ cid }) => useFileStatusStream({ enabled: true, conversationId: cid }),
++        { initialProps: { cid: 'c1' } },
++      );
++
++      act(() => {
++        sseInstances[0].dispatch('status', {
++          file_id: 'f1',
++          path: 'inline',
++          state: 'loaded',
++          chars: 50,
++        });
++      });
++      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
++
++      rerender({ cid: 'c2' });
++
++      expect(result.current.pathStatusByFileId).toEqual({});
++    });
++
++    it('clears live sessionFiles when conversationId changes', () => {
++      const { result, rerender } = renderHook(
++        ({ cid }) => useFileStatusStream({ enabled: true, conversationId: cid }),
++        { initialProps: { cid: 'c1' } },
++      );
++
++      act(() => {
++        sseInstances[0].dispatch('session_file', {
++          session_file: { session_id: 'A', file_id: 'sf-1', filename: 'old.csv' },
++        });
++      });
++      expect(result.current.sessionFiles).toHaveLength(1);
++
++      rerender({ cid: 'c2' });
++
++      expect(result.current.sessionFiles).toEqual([]);
++    });
++
++    it('resets state when token changes (logout / re-login on same browser)', () => {
++      const { result, rerender } = renderHook(() =>
++        useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++      );
++
++      act(() => {
++        sseInstances[0].dispatch('status', {
++          file_id: 'f1',
++          path: 'rag',
++          state: 'embedded',
++          chunks: 3,
++        });
++      });
++      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
++
++      mockToken = 'tok-new-user';
++      rerender();
++
++      expect(result.current.pathStatusByFileId).toEqual({});
++    });
++
++    it('does not reset state when none of the deps changed (re-render no-op)', () => {
++      const { result, rerender } = renderHook(() =>
++        useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++      );
++
++      act(() => {
++        sseInstances[0].dispatch('status', {
++          file_id: 'f1',
++          path: 'inline',
++          state: 'loaded',
++          chars: 10,
++        });
++      });
++      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
++
++      rerender();
++
++      expect(result.current.pathStatusByFileId['f1']).toBeDefined();
++    });
++  });
+ });
+diff --git a/client/src/hooks/Files/useFileStatusStream.ts b/client/src/hooks/Files/useFileStatusStream.ts
+index 46cf036..801a43e 100644
+--- a/client/src/hooks/Files/useFileStatusStream.ts
++++ b/client/src/hooks/Files/useFileStatusStream.ts
+@@ -66,6 +66,14 @@ export default function useFileStatusStream({
+   const sseRef = useRef<SSE | null>(null);
+ 
+   useEffect(() => {
++    // Fresh connection = fresh state. Prevents chips from one conversation
++    // (or one logged-in user) bleeding into the next when this hook stays
++    // mounted across navigation (codex review F2). React bails out of
++    // re-renders when setState is called with the same empty-shape value,
++    // so the no-op case (initial mount) is free.
++    setPathStatusByFileId({});
++    setLiveSessionFiles([]);
++
+     if (!enabled || !isAuthenticated || !token) return;
+ 
+     const url = conversationId
+-- 
+2.47.3
+

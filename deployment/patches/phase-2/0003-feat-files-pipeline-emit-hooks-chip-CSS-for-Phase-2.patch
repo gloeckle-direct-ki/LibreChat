@@ -1,7 +1,7 @@
 From bf9ad824699607176f775e1549b866324f047614 Mon Sep 17 00:00:00 2001
 From: pucawo <github@pucawo.de>
 Date: Wed, 6 May 2026 23:45:01 +0200
-Subject: [PATCH 3/3] feat(files): pipeline emit-hooks + chip CSS for Phase 2
+Subject: [PATCH 3/9] feat(files): pipeline emit-hooks + chip CSS for Phase 2
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

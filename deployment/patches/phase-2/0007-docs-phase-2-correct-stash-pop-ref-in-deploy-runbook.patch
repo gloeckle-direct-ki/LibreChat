@@ -1,0 +1,47 @@
+From 6e6f3e5b10d41d871448e7a9bbfeebc4f27829d2 Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Thu, 7 May 2026 00:12:25 +0200
+Subject: [PATCH 7/9] docs(phase-2): correct stash-pop ref in deploy runbook
+ (codex F6)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`git stash pop "phase-2-deploy-stash"` is invalid — git stash takes a
+stash@{N} reference, not a free-form message. Following the runbook
+literally would silently fail to restore the production customizations
+saved at the start of Stage 2.
+
+Replace with a small `git stash list | grep | cut` lookup that resolves
+the message back to the stash@{N} ref, plus an inline note explaining
+why the message-as-ref form does not work.
+---
+ deployment/phase-2-deploy-runbook.md | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/deployment/phase-2-deploy-runbook.md b/deployment/phase-2-deploy-runbook.md
+index a7c539e..e2224b7 100644
+--- a/deployment/phase-2-deploy-runbook.md
++++ b/deployment/phase-2-deploy-runbook.md
+@@ -74,8 +74,16 @@ gesehen):
+ 4. `api/server/routes/files/index.js` — append-only, sauber.
+ 
+ ```bash
+-# Nach erfolgreichem Apply:
+-git stash pop "phase-2-deploy-stash"   # bestehende customizations zurück
++# Nach erfolgreichem Apply: Stash wieder zurückholen.
++# WICHTIG: `git stash pop "phase-2-deploy-stash"` ist KEIN gültiger Stash-Ref —
++# git stash erwartet stash@{N}. Über die Message muss erst der Index gefunden
++# werden, oder direkt `stash@{0}` wenn nichts dazwischen gestashed wurde.
++STASH_REF=$(git stash list | grep "phase-2-deploy-stash" | head -1 | cut -d: -f1)
++if [ -n "$STASH_REF" ]; then
++  git stash pop "$STASH_REF"
++else
++  echo "phase-2-deploy-stash nicht gefunden — git stash list manuell prüfen."
++fi
+ # → ggf. nochmal mergen falls Konflikte
+ ```
+ 
+-- 
+2.47.3
+

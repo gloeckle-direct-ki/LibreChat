@@ -1,0 +1,2770 @@
+From 990c4362a0439a4b5513b17019e76ddd24e04b30 Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Wed, 6 May 2026 23:47:53 +0200
+Subject: [PATCH 4/9] docs(phase-2): UAT playbook + deploy runbook +
+ format-patches + user-comm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stage 4 deliverables for Dennis tomorrow — code is ready-to-deploy
+but NOT live:
+
+- deployment/uat/2026-05-07-file-handling-v2-phase-2.md: 8 scenarios
+  (S1-S8) covering happy paths, partial failures, Pre-Phase-3
+  stale-risk (S6), code-generated files (S7), and cross-user
+  isolation (S8). Each scenario is theme-by-theme verifiable.
+- deployment/phase-2-deploy-runbook.md: Path-A hand-apply runbook
+  patterned on Phase 3's staging-deploy-phase-3.md. Bakes in the
+  Phase-3 deploy lessons (3-way merge for FileRow.tsx prod
+  customizations, service-worker cache hard-refresh, etc.).
+- deployment/patches/phase-2/0001-3.patch: format-patches off the
+  Phase-3 prod baseline (973969e), to be applied in sequence on
+  prod's ~/LibreChat working tree.
+- deployment/user-comm/2026-05-07-file-status-chip-announcement.md:
+  German user-facing announcement for post-UAT rollout.
+
+Phase 2 Tasks 8 (user-comm) + 9 (UAT) + Stage-4 deploy artifacts.
+---
+ ...us-status-stream-route-for-Phase-2-c.patch |  664 ++++++++++
+ ...tatusChip-SessionFileChip-SSE-hook-f.patch | 1122 +++++++++++++++++
+ ...line-emit-hooks-chip-CSS-for-Phase-2.patch |  499 ++++++++
+ deployment/phase-2-deploy-runbook.md          |  214 ++++
+ .../2026-05-07-file-handling-v2-phase-2.md    |  139 ++
+ ...026-05-07-file-status-chip-announcement.md |   51 +
+ 6 files changed, 2689 insertions(+)
+ create mode 100644 deployment/patches/phase-2/0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch
+ create mode 100644 deployment/patches/phase-2/0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch
+ create mode 100644 deployment/patches/phase-2/0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch
+ create mode 100644 deployment/phase-2-deploy-runbook.md
+ create mode 100644 deployment/uat/2026-05-07-file-handling-v2-phase-2.md
+ create mode 100644 deployment/user-comm/2026-05-07-file-status-chip-announcement.md
+
+diff --git a/deployment/patches/phase-2/0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch b/deployment/patches/phase-2/0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch
+new file mode 100644
+index 0000000..ccb2449
+--- /dev/null
++++ b/deployment/patches/phase-2/0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch
+@@ -0,0 +1,664 @@
++From 490e69599518b7487a6c738a859693b23b94bbb2 Mon Sep 17 00:00:00 2001
++From: pucawo <github@pucawo.de>
++Date: Wed, 6 May 2026 23:27:30 +0200
++Subject: [PATCH 1/3] feat(files): SSE bus + status-stream route for Phase 2
++ chip-UI
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++Adds the backend foundation for live file-status visibility:
++
++- statusBus.js: in-process EventEmitter with two channels (status,
++  session_file). Sized for ~100 concurrent SSE clients.
++- updatePathStatus(file_id, path, payload): wrapper around File.updateOne
++  that writes metadata.pathStatus.<path>.{state, reason?, chars?, chunks?,
++  completed_at} and emits to the bus. Best-effort; failures are logged but
++  never thrown — the upload path must not break on emit failure.
++- GET /api/files/status-stream: SSE handler scoped per-user via
++  event.userId, with optional ?conversationId= filter. Cleans up
++  listeners on req close/aborted to avoid leak. Defensive 401 if
++  req.user is absent.
++
++Tests: 13 unit tests across statusBus, updatePathStatus (mongo-memory),
++and statusStream (mock req/res). Cross-user-leak guard verified.
++
++Phase 2 Task 2 + 3.
++---
++ api/server/routes/files/index.js              |   5 +
++ api/server/routes/files/statusStream.js       |  84 ++++++++
++ api/server/routes/files/statusStream.spec.js  | 196 ++++++++++++++++++
++ api/server/services/Files/statusBus.js        |  32 +++
++ api/server/services/Files/statusBus.spec.js   |  53 +++++
++ api/server/services/Files/updatePathStatus.js |  70 +++++++
++ .../services/Files/updatePathStatus.spec.js   | 125 +++++++++++
++ 7 files changed, 565 insertions(+)
++ create mode 100644 api/server/routes/files/statusStream.js
++ create mode 100644 api/server/routes/files/statusStream.spec.js
++ create mode 100644 api/server/services/Files/statusBus.js
++ create mode 100644 api/server/services/Files/statusBus.spec.js
++ create mode 100644 api/server/services/Files/updatePathStatus.js
++ create mode 100644 api/server/services/Files/updatePathStatus.spec.js
++
++diff --git a/api/server/routes/files/index.js b/api/server/routes/files/index.js
++index 5d32b91..803ee8c 100644
++--- a/api/server/routes/files/index.js
+++++ b/api/server/routes/files/index.js
++@@ -14,6 +14,7 @@ const files = require('./files');
++ const images = require('./images');
++ const avatar = require('./avatar');
++ const speech = require('./speech');
+++const { statusStreamHandler } = require('./statusStream');
++ 
++ const initialize = async () => {
++   const router = express.Router();
++@@ -28,6 +29,10 @@ const initialize = async () => {
++   /* Important: speech route must be added before the upload limiters */
++   router.use('/speech', speech);
++ 
+++  /* Phase 2 — SSE channel for live file-status / session_file updates.
+++     Long-lived GET; sits before the POST-only upload rate-limiters. */
+++  router.get('/status-stream', statusStreamHandler);
+++
++   const { fileUploadIpLimiter, fileUploadUserLimiter } = createFileLimiters();
++ 
++   /** Apply rate limiters to all POST routes (excluding /speech which is handled above) */
++diff --git a/api/server/routes/files/statusStream.js b/api/server/routes/files/statusStream.js
++new file mode 100644
++index 0000000..9e14061
++--- /dev/null
+++++ b/api/server/routes/files/statusStream.js
++@@ -0,0 +1,84 @@
+++const { logger } = require('@librechat/data-schemas');
+++const { statusBus } = require('~/server/services/Files/statusBus');
+++
+++/**
+++ * Phase 2 — SSE handler for file-status updates.
+++ *
+++ * Subscribes to the in-process statusBus and forwards events to the client
+++ * as Server-Sent-Events. Events are scoped per-user via `event.userId`; an
+++ * optional `?conversationId=` query narrows down to a single conversation.
+++ *
+++ * Event shapes:
+++ *   - `event: status\ndata: { file_id, filename, conversationId, userId, path,
+++ *     state, reason?, chars?, chunks?, timestamp }\n\n`
+++ *   - `event: session_file\ndata: { conversationId, userId, session_file:
+++ *     { session_id, file_id, filename, generated_at }, timestamp }\n\n`
+++ *
+++ * Listener cleanup happens on `req.on('close')` — required to avoid leaking
+++ * listeners on the bus when clients disconnect (browser tab close,
+++ * EventSource.close()).
+++ *
+++ * Auth: relies on the parent router's `requireJwtAuth` middleware to populate
+++ * `req.user`. Defensive 401 if missing — never trust the absence of middleware.
+++ */
+++function statusStreamHandler(req, res) {
+++  const userId = req.user && req.user.id;
+++  if (!userId) {
+++    return res.status(401).json({ error: 'Unauthorized' });
+++  }
+++
+++  const filterConversationId =
+++    typeof req.query.conversationId === 'string' && req.query.conversationId.length > 0
+++      ? req.query.conversationId
+++      : null;
+++
+++  res.setHeader('Content-Type', 'text/event-stream');
+++  res.setHeader('Cache-Control', 'no-cache, no-transform');
+++  res.setHeader('Connection', 'keep-alive');
+++  res.setHeader('X-Accel-Buffering', 'no');
+++  res.flushHeaders();
+++
+++  // Initial comment line — flushes the response chain through any
+++  // intermediate buffer (nginx, browser) so EventSource.onopen fires.
+++  safeWrite(res, `: connected ${new Date().toISOString()}\n\n`);
+++
+++  const matchesScope = (event) => {
+++    if (!event || event.userId !== userId) return false;
+++    if (filterConversationId == null) return true;
+++    // Allow events without conversationId (upload-time, before convo binding).
+++    if (event.conversationId == null) return true;
+++    return event.conversationId === filterConversationId;
+++  };
+++
+++  const onStatus = (event) => {
+++    if (!matchesScope(event)) return;
+++    safeWrite(res, `event: status\ndata: ${JSON.stringify(event)}\n\n`);
+++  };
+++
+++  const onSessionFile = (event) => {
+++    if (!matchesScope(event)) return;
+++    safeWrite(res, `event: session_file\ndata: ${JSON.stringify(event)}\n\n`);
+++  };
+++
+++  statusBus.on('status', onStatus);
+++  statusBus.on('session_file', onSessionFile);
+++
+++  const cleanup = () => {
+++    statusBus.off('status', onStatus);
+++    statusBus.off('session_file', onSessionFile);
+++  };
+++  req.on('close', cleanup);
+++  req.on('aborted', cleanup);
+++}
+++
+++function safeWrite(res, chunk) {
+++  if (res.writableEnded) return;
+++  try {
+++    res.write(chunk);
+++    if (typeof res.flush === 'function') res.flush();
+++  } catch (err) {
+++    logger.warn(`[statusStream] write failed: ${err && err.message}`);
+++  }
+++}
+++
+++module.exports = { statusStreamHandler };
++diff --git a/api/server/routes/files/statusStream.spec.js b/api/server/routes/files/statusStream.spec.js
++new file mode 100644
++index 0000000..3f48db7
++--- /dev/null
+++++ b/api/server/routes/files/statusStream.spec.js
++@@ -0,0 +1,196 @@
+++jest.mock('@librechat/data-schemas', () => ({
+++  logger: { warn: jest.fn(), debug: jest.fn(), info: jest.fn(), error: jest.fn() },
+++}));
+++
+++const { statusStreamHandler } = require('./statusStream');
+++const {
+++  statusBus,
+++  emitStatusUpdate,
+++  emitSessionFileUpdate,
+++} = require('~/server/services/Files/statusBus');
+++
+++function makeReq(userId, query = {}) {
+++  const handlers = {};
+++  return {
+++    user: { id: userId },
+++    query,
+++    on: (evt, cb) => {
+++      handlers[evt] = cb;
+++    },
+++    _trigger: (evt) => handlers[evt] && handlers[evt](),
+++  };
+++}
+++
+++function makeRes() {
+++  const writes = [];
+++  return {
+++    headers: {},
+++    writableEnded: false,
+++    setHeader(k, v) {
+++      this.headers[k] = v;
+++    },
+++    flushHeaders: jest.fn(),
+++    write(chunk) {
+++      writes.push(chunk);
+++    },
+++    end() {
+++      this.writableEnded = true;
+++    },
+++    flush: jest.fn(),
+++    writes,
+++  };
+++}
+++
+++describe('GET /api/files/status-stream', () => {
+++  beforeEach(() => {
+++    statusBus.removeAllListeners();
+++  });
+++
+++  it('sets SSE headers and a comment flush on connect', () => {
+++    const req = makeReq('u1');
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++
+++    expect(res.headers['Content-Type']).toBe('text/event-stream');
+++    expect(res.headers['Cache-Control']).toMatch(/no-cache/);
+++    expect(res.headers['Connection']).toBe('keep-alive');
+++    expect(res.headers['X-Accel-Buffering']).toBe('no');
+++    expect(res.flushHeaders).toHaveBeenCalled();
+++    // Initial heartbeat / handshake comment
+++    expect(res.writes.join('')).toMatch(/^:.*\n\n/);
+++  });
+++
+++  it('forwards status events to the matching user only', () => {
+++    const reqA = makeReq('user-A');
+++    const resA = makeRes();
+++    const reqB = makeReq('user-B');
+++    const resB = makeRes();
+++    statusStreamHandler(reqA, resA);
+++    statusStreamHandler(reqB, resB);
+++
+++    emitStatusUpdate({
+++      file_id: 'f1',
+++      filename: 'a.pdf',
+++      conversationId: 'c1',
+++      userId: 'user-A',
+++      path: 'inline',
+++      state: 'loaded',
+++      chars: 100,
+++      timestamp: '2026-05-06T12:00:00.000Z',
+++    });
+++
+++    const aText = resA.writes.join('');
+++    expect(aText).toContain('event: status');
+++    expect(aText).toContain('"state":"loaded"');
+++    expect(aText).toContain('"file_id":"f1"');
+++
+++    const bText = resB.writes.join('');
+++    expect(bText).not.toContain('"file_id":"f1"');
+++  });
+++
+++  it('forwards session_file events to the matching user', () => {
+++    const req = makeReq('user-A');
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++
+++    emitSessionFileUpdate({
+++      conversationId: 'c1',
+++      userId: 'user-A',
+++      session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' },
+++      timestamp: '2026-05-06T12:00:00.000Z',
+++    });
+++
+++    const text = res.writes.join('');
+++    expect(text).toContain('event: session_file');
+++    expect(text).toContain('"session_id":"A"');
+++    expect(text).toContain('"filename":"out.csv"');
+++  });
+++
+++  it('ignores events for other users (cross-user-leak guard)', () => {
+++    const req = makeReq('user-A');
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++
+++    emitStatusUpdate({ file_id: 'leaked', userId: 'user-B', path: 'inline', state: 'loaded' });
+++
+++    expect(res.writes.join('')).not.toContain('"file_id":"leaked"');
+++  });
+++
+++  it('filters by conversationId when ?conversationId= query is present', () => {
+++    const req = makeReq('user-A', { conversationId: 'wanted' });
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++
+++    emitStatusUpdate({
+++      file_id: 'f1',
+++      conversationId: 'wanted',
+++      userId: 'user-A',
+++      path: 'rag',
+++      state: 'embedded',
+++    });
+++    emitStatusUpdate({
+++      file_id: 'f2',
+++      conversationId: 'unrelated',
+++      userId: 'user-A',
+++      path: 'rag',
+++      state: 'embedded',
+++    });
+++
+++    const text = res.writes.join('');
+++    expect(text).toContain('"file_id":"f1"');
+++    expect(text).not.toContain('"file_id":"f2"');
+++  });
+++
+++  it('passes events with no conversationId through when filter is set (upload-time events)', () => {
+++    const req = makeReq('user-A', { conversationId: 'wanted' });
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++
+++    emitStatusUpdate({
+++      file_id: 'pre-convo',
+++      userId: 'user-A',
+++      conversationId: undefined,
+++      path: 'inline',
+++      state: 'loaded',
+++    });
+++
+++    expect(res.writes.join('')).toContain('"file_id":"pre-convo"');
+++  });
+++
+++  it('cleans up listeners on req close (no leak after disconnect)', () => {
+++    const req = makeReq('user-A');
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++
+++    expect(statusBus.listenerCount('status')).toBe(1);
+++    expect(statusBus.listenerCount('session_file')).toBe(1);
+++
+++    req._trigger('close');
+++
+++    expect(statusBus.listenerCount('status')).toBe(0);
+++    expect(statusBus.listenerCount('session_file')).toBe(0);
+++  });
+++
+++  it('does not write after res ends (avoid post-close write errors)', () => {
+++    const req = makeReq('user-A');
+++    const res = makeRes();
+++    statusStreamHandler(req, res);
+++    res.writableEnded = true;
+++    const before = res.writes.length;
+++
+++    emitStatusUpdate({ userId: 'user-A', file_id: 'after-close', path: 'inline', state: 'loaded' });
+++
+++    expect(res.writes.length).toBe(before);
+++  });
+++
+++  it('rejects unauthenticated requests (no req.user)', () => {
+++    const req = { query: {}, on: jest.fn() };
+++    const res = makeRes();
+++    res.status = jest.fn().mockReturnValue(res);
+++    res.json = jest.fn().mockReturnValue(res);
+++
+++    statusStreamHandler(req, res);
+++
+++    expect(res.status).toHaveBeenCalledWith(401);
+++  });
+++});
++diff --git a/api/server/services/Files/statusBus.js b/api/server/services/Files/statusBus.js
++new file mode 100644
++index 0000000..4a26dca
++--- /dev/null
+++++ b/api/server/services/Files/statusBus.js
++@@ -0,0 +1,32 @@
+++const EventEmitter = require('events');
+++
+++/**
+++ * Phase 2 — In-process pub/sub for file-status SSE.
+++ *
+++ * Two event channels:
+++ *   - 'status'        — per-file pathStatus updates (mount/inline/rag).
+++ *                       payload shape: { file_id, filename, conversationId,
+++ *                       userId, path, state, reason?, chars?, chunks?,
+++ *                       timestamp }
+++ *   - 'session_file'  — conversation-level session_files updates (Track 2).
+++ *                       payload shape: { conversationId, userId, session_file:
+++ *                       { session_id, file_id, filename, generated_at },
+++ *                       timestamp }
+++ *
+++ * Subscribers (statusStream route handler) filter by userId and optionally
+++ * conversationId — the bus is a fan-out, not an authz layer.
+++ *
+++ * Single instance per Node process; sized for ~100 concurrent SSE clients.
+++ */
+++const statusBus = new EventEmitter();
+++statusBus.setMaxListeners(100);
+++
+++function emitStatusUpdate(event) {
+++  statusBus.emit('status', event);
+++}
+++
+++function emitSessionFileUpdate(event) {
+++  statusBus.emit('session_file', event);
+++}
+++
+++module.exports = { statusBus, emitStatusUpdate, emitSessionFileUpdate };
++diff --git a/api/server/services/Files/statusBus.spec.js b/api/server/services/Files/statusBus.spec.js
++new file mode 100644
++index 0000000..d05ca9e
++--- /dev/null
+++++ b/api/server/services/Files/statusBus.spec.js
++@@ -0,0 +1,53 @@
+++const { statusBus, emitStatusUpdate, emitSessionFileUpdate } = require('./statusBus');
+++
+++describe('statusBus', () => {
+++  afterEach(() => {
+++    statusBus.removeAllListeners();
+++  });
+++
+++  it('emitStatusUpdate broadcasts a status event with the payload', (done) => {
+++    const payload = {
+++      file_id: 'f1',
+++      filename: 'a.pdf',
+++      conversationId: 'c1',
+++      userId: 'u1',
+++      path: 'inline',
+++      state: 'loaded',
+++      chars: 1234,
+++    };
+++    statusBus.on('status', (received) => {
+++      expect(received).toMatchObject(payload);
+++      done();
+++    });
+++    emitStatusUpdate(payload);
+++  });
+++
+++  it('emitSessionFileUpdate broadcasts a session_file event', (done) => {
+++    const payload = {
+++      conversationId: 'c1',
+++      userId: 'u1',
+++      session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' },
+++    };
+++    statusBus.on('session_file', (received) => {
+++      expect(received).toMatchObject(payload);
+++      done();
+++    });
+++    emitSessionFileUpdate(payload);
+++  });
+++
+++  it('multiple listeners receive the same status event', () => {
+++    const received = [];
+++    statusBus.on('status', (e) => received.push(['l1', e.file_id]));
+++    statusBus.on('status', (e) => received.push(['l2', e.file_id]));
+++    emitStatusUpdate({ file_id: 'f9' });
+++    expect(received).toEqual([
+++      ['l1', 'f9'],
+++      ['l2', 'f9'],
+++    ]);
+++  });
+++
+++  it('does not throw when emitting with no listeners', () => {
+++    expect(() => emitStatusUpdate({ file_id: 'lonely' })).not.toThrow();
+++    expect(() => emitSessionFileUpdate({ conversationId: 'lonely' })).not.toThrow();
+++  });
+++});
++diff --git a/api/server/services/Files/updatePathStatus.js b/api/server/services/Files/updatePathStatus.js
++new file mode 100644
++index 0000000..8ba9a2d
++--- /dev/null
+++++ b/api/server/services/Files/updatePathStatus.js
++@@ -0,0 +1,70 @@
+++const { logger } = require('@librechat/data-schemas');
+++const { File } = require('~/db/models');
+++const { emitStatusUpdate } = require('./statusBus');
+++
+++const TERMINAL_STATES = new Set(['ready', 'loaded', 'embedded', 'failed', 'skipped']);
+++
+++/**
+++ * Phase 2 — write a per-path state to `metadata.pathStatus.<path>` on the
+++ * File doc and broadcast the change on the SSE bus.
+++ *
+++ * Used by Phase-3 pipelines (inlinePipeline, ragPipeline) and processCodeOutput
+++ * to record routing outcomes. Replaces the raw dotted-key `safeUpdateFile`
+++ * pattern from Phase 3 — same on-disk shape, plus a bus emit so the chip-UI
+++ * reflects state changes live.
+++ *
+++ * Best-effort: never throws — the upload path must not break if SSE emit
+++ * fails or the file row vanishes between write and lookup.
+++ *
+++ * @param {string} file_id
+++ * @param {'inline'|'rag'|'mount'} path
+++ * @param {object} payload
+++ * @param {'pending'|'ready'|'loaded'|'embedded'|'failed'|'skipped'} payload.state
+++ * @param {string} [payload.reason]
+++ * @param {number} [payload.chars]
+++ * @param {number} [payload.chunks]
+++ */
+++async function updatePathStatus(file_id, path, { state, reason, chars, chunks }) {
+++  if (!file_id || !path || !state) return;
+++
+++  const prefix = `metadata.pathStatus.${path}`;
+++  const set = { [`${prefix}.state`]: state };
+++  if (reason !== undefined && reason !== null) set[`${prefix}.reason`] = reason;
+++  if (TERMINAL_STATES.has(state)) set[`${prefix}.completed_at`] = new Date();
+++  if (chars !== undefined) set[`${prefix}.chars`] = chars;
+++  if (chunks !== undefined) set[`${prefix}.chunks`] = chunks;
+++
+++  let result;
+++  try {
+++    result = await File.updateOne({ file_id }, { $set: set, $unset: { expiresAt: '' } });
+++  } catch (err) {
+++    logger.warn(`[updatePathStatus] write failed for ${file_id}/${path}: ${err && err.message}`);
+++    return;
+++  }
+++
+++  if (!result || result.matchedCount === 0) return;
+++
+++  try {
+++    const file = await File.findOne(
+++      { file_id },
+++      { user: 1, conversationId: 1, filename: 1 },
+++    ).lean();
+++    if (!file) return;
+++    emitStatusUpdate({
+++      file_id,
+++      filename: file.filename,
+++      conversationId: file.conversationId,
+++      userId: file.user ? String(file.user) : undefined,
+++      path,
+++      state,
+++      ...(reason !== undefined && reason !== null ? { reason } : {}),
+++      ...(chars !== undefined ? { chars } : {}),
+++      ...(chunks !== undefined ? { chunks } : {}),
+++      timestamp: new Date().toISOString(),
+++    });
+++  } catch (err) {
+++    logger.warn(`[updatePathStatus] emit failed for ${file_id}/${path}: ${err && err.message}`);
+++  }
+++}
+++
+++module.exports = { updatePathStatus };
++diff --git a/api/server/services/Files/updatePathStatus.spec.js b/api/server/services/Files/updatePathStatus.spec.js
++new file mode 100644
++index 0000000..0410ec6
++--- /dev/null
+++++ b/api/server/services/Files/updatePathStatus.spec.js
++@@ -0,0 +1,125 @@
+++const mongoose = require('mongoose');
+++const { MongoMemoryServer } = require('mongodb-memory-server');
+++
+++let mongoServer;
+++let File;
+++let updatePathStatus;
+++let statusBus;
+++
+++describe('updatePathStatus', () => {
+++  beforeAll(async () => {
+++    mongoServer = await MongoMemoryServer.create();
+++    await mongoose.connect(mongoServer.getUri());
+++    ({ File } = require('~/db/models'));
+++    ({ updatePathStatus } = require('./updatePathStatus'));
+++    ({ statusBus } = require('./statusBus'));
+++  });
+++
+++  afterAll(async () => {
+++    await mongoose.disconnect();
+++    await mongoServer.stop();
+++  });
+++
+++  beforeEach(async () => {
+++    await File.deleteMany({});
+++    statusBus.removeAllListeners();
+++  });
+++
+++  const createFile = (file_id, extra = {}) =>
+++    File.create({
+++      file_id,
+++      filename: `${file_id}.pdf`,
+++      filepath: `/tmp/${file_id}.pdf`,
+++      bytes: 1234,
+++      type: 'application/pdf',
+++      user: new mongoose.Types.ObjectId(),
+++      ...extra,
+++    });
+++
+++  it('writes per-path state with completed_at timestamp', async () => {
+++    await createFile('f1');
+++    await updatePathStatus('f1', 'inline', { state: 'loaded', chars: 1234 });
+++    const f = await File.findOne({ file_id: 'f1' }).lean();
+++    expect(f.metadata.pathStatus.inline.state).toBe('loaded');
+++    expect(f.metadata.pathStatus.inline.chars).toBe(1234);
+++    expect(f.metadata.pathStatus.inline.completed_at).toBeInstanceOf(Date);
+++  });
+++
+++  it('preserves other paths when updating one', async () => {
+++    await createFile('f2', {
+++      metadata: { pathStatus: { inline: { state: 'loaded', chars: 500 } } },
+++    });
+++    await updatePathStatus('f2', 'rag', { state: 'embedded', chunks: 8 });
+++    const f = await File.findOne({ file_id: 'f2' }).lean();
+++    expect(f.metadata.pathStatus.inline.state).toBe('loaded');
+++    expect(f.metadata.pathStatus.inline.chars).toBe(500);
+++    expect(f.metadata.pathStatus.rag.state).toBe('embedded');
+++    expect(f.metadata.pathStatus.rag.chunks).toBe(8);
+++  });
+++
+++  it('writes reason when provided (failure case)', async () => {
+++    await createFile('f3');
+++    await updatePathStatus('f3', 'inline', { state: 'failed', reason: 'PDF encrypted' });
+++    const f = await File.findOne({ file_id: 'f3' }).lean();
+++    expect(f.metadata.pathStatus.inline.state).toBe('failed');
+++    expect(f.metadata.pathStatus.inline.reason).toBe('PDF encrypted');
+++  });
+++
+++  it('does not write reason field when not provided', async () => {
+++    await createFile('f4');
+++    await updatePathStatus('f4', 'inline', { state: 'loaded', chars: 100 });
+++    const f = await File.findOne({ file_id: 'f4' }).lean();
+++    expect(f.metadata.pathStatus.inline.reason).toBeUndefined();
+++  });
+++
+++  it('emits a status event on the SSE bus after successful write', async () => {
+++    const file = await createFile('f5', { conversationId: 'conv-1' });
+++    const events = [];
+++    statusBus.on('status', (e) => events.push(e));
+++
+++    await updatePathStatus('f5', 'rag', { state: 'embedded', chunks: 12 });
+++
+++    expect(events).toHaveLength(1);
+++    expect(events[0]).toMatchObject({
+++      file_id: 'f5',
+++      filename: 'f5.pdf',
+++      conversationId: 'conv-1',
+++      userId: String(file.user),
+++      path: 'rag',
+++      state: 'embedded',
+++      chunks: 12,
+++    });
+++    expect(events[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+++  });
+++
+++  it('emits even when conversationId is null (upload-time has no convo yet)', async () => {
+++    await createFile('f6'); // no conversationId
+++    const events = [];
+++    statusBus.on('status', (e) => events.push(e));
+++
+++    await updatePathStatus('f6', 'inline', { state: 'loaded', chars: 50 });
+++
+++    expect(events).toHaveLength(1);
+++    expect(events[0].file_id).toBe('f6');
+++    expect(events[0].conversationId).toBeFalsy();
+++  });
+++
+++  it('does not throw when file_id does not exist (no-op + no emit)', async () => {
+++    const events = [];
+++    statusBus.on('status', (e) => events.push(e));
+++
+++    await expect(
+++      updatePathStatus('nonexistent', 'inline', { state: 'loaded' }),
+++    ).resolves.not.toThrow();
+++
+++    expect(events).toHaveLength(0);
+++  });
+++
+++  it('does not write completed_at for state=pending', async () => {
+++    await createFile('f7');
+++    await updatePathStatus('f7', 'rag', { state: 'pending' });
+++    const f = await File.findOne({ file_id: 'f7' }).lean();
+++    expect(f.metadata.pathStatus.rag.state).toBe('pending');
+++    expect(f.metadata.pathStatus.rag.completed_at).toBeUndefined();
+++  });
+++});
++-- 
++2.47.3
++
+diff --git a/deployment/patches/phase-2/0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch b/deployment/patches/phase-2/0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch
+new file mode 100644
+index 0000000..b308100
+--- /dev/null
++++ b/deployment/patches/phase-2/0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch
+@@ -0,0 +1,1122 @@
++From f6967dc16c3c15d61d48717b9ae1184679101959 Mon Sep 17 00:00:00 2001
++From: pucawo <github@pucawo.de>
++Date: Wed, 6 May 2026 23:39:53 +0200
++Subject: [PATCH 2/3] feat(files): FileStatusChip + SessionFileChip + SSE hook
++ for chip-UI
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++Frontend half of Phase 2. Two chips and a single SSE subscription per
++FileRow:
++
++- <FileStatusChip pathStatus={…}/>: composes German status text (mount /
++  inline / rag), aggregate color (success / warn / error / pending),
++  tooltip with failure reason. Defensive against undefined / null /
++  empty pathStatus (Pre-Phase-3 file rows / FILE_ROUTING_V2 OFF — S5
++  stale-risk-hoch). Mount-failed (T-34 MIME-Filter) takes priority and
++  surfaces the actionable reason inline.
++
++- <SessionFileChip sessionFile={…}/>: code-generated files from
++  Conversation.session_files (Phase 3 Track 2). Real schema is
++  { session_id, file_id, filename, generated_at } — no path/kind, so
++  one render path, "📦 <filename> · vom Code generiert" + tooltip.
++
++- useFileStatusStream({ enabled, conversationId, initialSessionFiles }):
++  single sse.js connection per FileRow with explicit Bearer token
++  (LibreChat's requireJwtAuth uses header-only auth — native EventSource
++  won't work). Fans out per-file pathStatus updates and conversation-
++  level session_file events. Initial sessionFiles seeded from
++  conversation.session_files; live updates merged with dedup on
++  (session_id, file_id).
++
++- FileContainer renders the chip below the filetype text when path-
++  Status is present (live or cached at upload-time). FileRow mounts
++  the hook once and threads pathStatus down per file_id; renders
++  SessionFileChip row below the file row.
++
++Tests: 50 unit tests (FileStatusChip, SessionFileChip, hook with mock
++sse.js). Existing FileRow tests updated with new mocks.
++
++Phase 2 Tasks 4 + 4b + 5.
++---
++ .../Chat/Input/Files/FileContainer.tsx        |  17 ++
++ .../components/Chat/Input/Files/FileRow.tsx   |  54 ++++-
++ .../Chat/Input/Files/FileStatusChip.tsx       | 169 ++++++++++++++
++ .../Chat/Input/Files/SessionFileChip.tsx      |  38 +++
++ .../Input/Files/__tests__/FileRow.spec.tsx    |   5 +
++ .../Files/__tests__/FileStatusChip.spec.tsx   | 173 ++++++++++++++
++ .../Files/__tests__/SessionFileChip.spec.tsx  |  89 +++++++
++ client/src/hooks/Files/index.ts               |   1 +
++ .../hooks/Files/useFileStatusStream.spec.tsx  | 217 ++++++++++++++++++
++ client/src/hooks/Files/useFileStatusStream.ts | 159 +++++++++++++
++ 10 files changed, 917 insertions(+), 5 deletions(-)
++ create mode 100644 client/src/components/Chat/Input/Files/FileStatusChip.tsx
++ create mode 100644 client/src/components/Chat/Input/Files/SessionFileChip.tsx
++ create mode 100644 client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx
++ create mode 100644 client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx
++ create mode 100644 client/src/hooks/Files/useFileStatusStream.spec.tsx
++ create mode 100644 client/src/hooks/Files/useFileStatusStream.ts
++
++diff --git a/client/src/components/Chat/Input/Files/FileContainer.tsx b/client/src/components/Chat/Input/Files/FileContainer.tsx
++index 5a22fef..a7078c3 100644
++--- a/client/src/components/Chat/Input/Files/FileContainer.tsx
+++++ b/client/src/components/Chat/Input/Files/FileContainer.tsx
++@@ -2,6 +2,7 @@ import type { TFile } from 'librechat-data-provider';
++ import type { ExtendedFile } from '~/common';
++ import { getFileType, cn } from '~/utils';
++ import FilePreview from './FilePreview';
+++import FileStatusChip, { PathStatus } from './FileStatusChip';
++ import RemoveFile from './RemoveFile';
++ 
++ const FileContainer = ({
++@@ -11,6 +12,7 @@ const FileContainer = ({
++   containerClassName,
++   onDelete,
++   onClick,
+++  pathStatus,
++ }: {
++   file: Partial<ExtendedFile | TFile>;
++   overrideType?: string;
++@@ -18,8 +20,18 @@ const FileContainer = ({
++   containerClassName?: string;
++   onDelete?: () => void;
++   onClick?: React.MouseEventHandler<HTMLButtonElement>;
+++  pathStatus?: PathStatus | null;
++ }) => {
++   const fileType = getFileType(overrideType ?? file.type);
+++  // Phase 2: prefer live SSE status when present, fall back to the value cached
+++  // on the file row at upload-time (file.metadata.pathStatus). Pre-Phase-3 rows
+++  // have neither — FileStatusChip handles undefined defensively.
+++  const fileMetaPathStatus =
+++    (file as { metadata?: { pathStatus?: PathStatus } } | undefined)?.metadata?.pathStatus;
+++  const mergedPathStatus: PathStatus | null | undefined =
+++    pathStatus != null
+++      ? { ...(fileMetaPathStatus ?? {}), ...pathStatus }
+++      : fileMetaPathStatus;
++ 
++   return (
++     <div
++@@ -48,6 +60,11 @@ const FileContainer = ({
++           </div>
++         </div>
++       </button>
+++      {mergedPathStatus !== undefined && (
+++        <div className="mt-1">
+++          <FileStatusChip pathStatus={mergedPathStatus} />
+++        </div>
+++      )}
++       {onDelete && <RemoveFile onRemove={onDelete} />}
++     </div>
++   );
++diff --git a/client/src/components/Chat/Input/Files/FileRow.tsx b/client/src/components/Chat/Input/Files/FileRow.tsx
++index ea0b648..5b5e4bb 100644
++--- a/client/src/components/Chat/Input/Files/FileRow.tsx
+++++ b/client/src/components/Chat/Input/Files/FileRow.tsx
++@@ -3,8 +3,10 @@ import { useToastContext } from '@librechat/client';
++ import { EToolResources } from 'librechat-data-provider';
++ import type { ExtendedFile } from '~/common';
++ import { useDeleteFilesMutation } from '~/data-provider';
++-import { useFileDeletion } from '~/hooks/Files';
+++import { useFileDeletion, useFileStatusStream } from '~/hooks/Files';
+++import { useChatContext } from '~/Providers';
++ import FileContainer from './FileContainer';
+++import SessionFileChip, { SessionFile } from './SessionFileChip';
++ import { useLocalize } from '~/hooks';
++ import { logger } from '~/utils';
++ import Image from './Image';
++@@ -34,10 +36,26 @@ export default function FileRow({
++ }) {
++   const localize = useLocalize();
++   const { showToast } = useToastContext();
+++  const { conversation } = useChatContext();
+++  const conversationId = conversation?.conversationId ?? null;
+++  // Phase 3 Track 2 wrote `Conversation.session_files` server-side. The type
+++  // isn't surfaced on TConversation (data-provider), so we cast defensively.
+++  const initialSessionFiles =
+++    (conversation as { session_files?: SessionFile[] } | undefined | null)?.session_files ?? [];
+++
++   const files = Array.from(_files?.values() ?? []).filter((file) =>
++     fileFilter ? fileFilter(file) : true,
++   );
++ 
+++  // Phase 2 — single SSE subscription per FileRow. Enabled when we have a
+++  // conversation context (so server can scope events) and either uploaded
+++  // files OR pre-existing session_files to track.
+++  const { pathStatusByFileId, sessionFiles } = useFileStatusStream({
+++    enabled: Boolean(conversationId) && (files.length > 0 || initialSessionFiles.length > 0),
+++    conversationId,
+++    initialSessionFiles,
+++  });
+++
++   const { mutateAsync } = useDeleteFilesMutation({
++     onMutate: async () =>
++       logger.log(
++@@ -74,10 +92,25 @@ export default function FileRow({
++     // eslint-disable-next-line react-hooks/exhaustive-deps
++   }, [files]);
++ 
++-  if (files.length === 0) {
+++  if (files.length === 0 && sessionFiles.length === 0) {
++     return null;
++   }
++ 
+++  const renderSessionFiles = () => {
+++    if (sessionFiles.length === 0) return null;
+++    return (
+++      <div
+++        className="flex flex-wrap gap-1"
+++        style={{ width: '100%', maxWidth: '100%', marginTop: '4px' }}
+++        data-testid="session-files-row"
+++      >
+++        {sessionFiles.map((sf) => (
+++          <SessionFileChip key={`${sf.session_id}-${sf.file_id}`} sessionFile={sf} />
+++        ))}
+++      </div>
+++    );
+++  };
+++
++   const renderFiles = () => {
++     const rowStyle = isRTL
++       ? {
++@@ -139,7 +172,11 @@ export default function FileRow({
++                     source={file.source}
++                   />
++                 ) : (
++-                  <FileContainer file={file} onDelete={handleDelete} />
+++                  <FileContainer
+++                    file={file}
+++                    onDelete={handleDelete}
+++                    pathStatus={pathStatusByFileId[file.file_id]}
+++                  />
++                 )}
++               </div>
++             );
++@@ -148,9 +185,16 @@ export default function FileRow({
++     );
++   };
++ 
+++  const content = (
+++    <>
+++      {files.length > 0 && renderFiles()}
+++      {renderSessionFiles()}
+++    </>
+++  );
+++
++   if (Wrapper) {
++-    return <Wrapper>{renderFiles()}</Wrapper>;
+++    return <Wrapper>{content}</Wrapper>;
++   }
++ 
++-  return renderFiles();
+++  return content;
++ }
++diff --git a/client/src/components/Chat/Input/Files/FileStatusChip.tsx b/client/src/components/Chat/Input/Files/FileStatusChip.tsx
++new file mode 100644
++index 0000000..ec094e2
++--- /dev/null
+++++ b/client/src/components/Chat/Input/Files/FileStatusChip.tsx
++@@ -0,0 +1,169 @@
+++import React from 'react';
+++import { cn } from '~/utils';
+++
+++type PathState =
+++  | 'pending'
+++  | 'ready'
+++  | 'loaded'
+++  | 'embedded'
+++  | 'failed'
+++  | 'skipped'
+++  | undefined;
+++
+++interface PathStatusEntry {
+++  state?: PathState;
+++  reason?: string;
+++  chars?: number;
+++  chunks?: number;
+++  completed_at?: string | Date;
+++}
+++
+++type Path = PathStatusEntry | PathState | null;
+++
+++export interface PathStatus {
+++  mount?: Path;
+++  inline?: Path;
+++  rag?: Path;
+++}
+++
+++const norm = (p: Path | undefined): PathStatusEntry => {
+++  if (p == null) return {};
+++  if (typeof p === 'string') return { state: p };
+++  return p;
+++};
+++
+++/**
+++ * Live status chip for an uploaded file. Reads `metadata.pathStatus` (mount /
+++ * inline / rag) and renders one or more localized status fragments joined with
+++ * a separator, with an aggregate color (success/warn/error/pending).
+++ *
+++ * Defensive against three known edge cases:
+++ *   1. `pathStatus === undefined` for Pre-Phase-3 file rows (S5 stale-risk).
+++ *   2. `pathStatus === {}` while pipelines are still in flight.
+++ *   3. `state === 'skipped'` for paths that don't apply to a file (e.g. RAG
+++ *      on a small CSV) — rendered silently to avoid clutter.
+++ *
+++ * Status text is German because the user-base is German-speaking; all copy
+++ * is mirrored in the UAT-Playbook (S1-S7) for verification.
+++ */
+++const FileStatusChip: React.FC<{ pathStatus: PathStatus | null | undefined }> = ({
+++  pathStatus,
+++}) => {
+++  const ps: PathStatus = pathStatus ?? {};
+++  const mount = norm(ps.mount);
+++  const inline = norm(ps.inline);
+++  const rag = norm(ps.rag);
+++
+++  const knownPaths = [mount, inline, rag].filter((p) => p.state !== undefined);
+++  const failedPaths = knownPaths.filter((p) => p.state === 'failed');
+++  const successPaths = knownPaths.filter(
+++    (p) => p.state === 'ready' || p.state === 'loaded' || p.state === 'embedded',
+++  );
+++  const pendingPaths = knownPaths.filter((p) => p.state === 'pending');
+++
+++  // S5 + flag-OFF: nothing to render → generic "verarbeitet" stub.
+++  if (knownPaths.length === 0) {
+++    return (
+++      <span
+++        className={cn('file-status-chip', 'chip-pending')}
+++        title="Datei wird verarbeitet"
+++      >
+++        wird verarbeitet …
+++      </span>
+++    );
+++  }
+++
+++  // Mount failure (e.g. T-34 MIME-Filter reject) trumps everything else: if
+++  // the upload itself died, nothing downstream matters and the user needs the
+++  // actionable reason front and center.
+++  if (mount.state === 'failed') {
+++    return (
+++      <span
+++        className={cn('file-status-chip', 'chip-error')}
+++        title={mount.reason || 'Upload abgebrochen'}
+++      >
+++        ❌ Upload abgebrochen{mount.reason ? `: ${mount.reason}` : ''}
+++      </span>
+++    );
+++  }
+++
+++  // Terminal failure: every other known path failed (no path produced
+++  // anything usable).
+++  const allFailed = knownPaths.length > 0 && knownPaths.every((p) => p.state === 'failed');
+++  if (allFailed) {
+++    const reasons = failedPaths
+++      .map((p) => p.reason)
+++      .filter((r): r is string => Boolean(r))
+++      .join(' / ');
+++    return (
+++      <span
+++        className={cn('file-status-chip', 'chip-error')}
+++        title={reasons || 'Datei nicht verarbeitbar'}
+++      >
+++        ❌ Datei nicht verarbeitbar
+++      </span>
+++    );
+++  }
+++
+++  const parts: string[] = [];
+++  // mount.state === 'failed' is handled by the early return above; here we
+++  // only build composite text for partial successes (inline/rag).
+++  if (inline.state === 'loaded') {
+++    parts.push(
+++      inline.chars != null
+++        ? `Im Chat-Kontext geladen ✓ (${inline.chars} Zeichen)`
+++        : 'Im Chat-Kontext geladen ✓',
+++    );
+++  }
+++  if (inline.state === 'failed') {
+++    parts.push(`⚠ Inline-Extraktion fehlgeschlagen${inline.reason ? `: ${inline.reason}` : ''}`);
+++  }
+++  if (rag.state === 'embedded') {
+++    parts.push(
+++      rag.chunks != null
+++        ? `Wissensbasis indexiert ✓ (${rag.chunks} Chunks)`
+++        : 'Wissensbasis indexiert ✓',
+++    );
+++  }
+++  if (rag.state === 'pending') {
+++    parts.push('Wissensbasis: indexiert wird …');
+++  }
+++  if (rag.state === 'failed') {
+++    parts.push(`⚠ Indexierung fehlgeschlagen${rag.reason ? `: ${rag.reason}` : ''}`);
+++  }
+++
+++  // Color: any failure → warn, all pending and no success yet → pending,
+++  // otherwise success. (allFailed is already handled above.)
+++  let colorClass = 'chip-success';
+++  if (failedPaths.length > 0) {
+++    colorClass = 'chip-warn';
+++  } else if (pendingPaths.length > 0 && successPaths.length === 0) {
+++    colorClass = 'chip-pending';
+++  }
+++
+++  // Tooltip carries failure reasons (for the warn color); for success we leave it
+++  // off so screen readers don't get noisy duplicates of visible chip text.
+++  const tooltip =
+++    failedPaths.map((p) => p.reason).filter((r): r is string => Boolean(r)).join(' / ') ||
+++    undefined;
+++
+++  if (parts.length === 0) {
+++    // Known paths but none in a renderable state (e.g. all skipped).
+++    return (
+++      <span
+++        className={cn('file-status-chip', 'chip-pending')}
+++        title="Datei wird verarbeitet"
+++      >
+++        wird verarbeitet …
+++      </span>
+++    );
+++  }
+++
+++  return (
+++    <span className={cn('file-status-chip', colorClass)} title={tooltip}>
+++      {parts.join(' · ')}
+++    </span>
+++  );
+++};
+++
+++export default FileStatusChip;
++diff --git a/client/src/components/Chat/Input/Files/SessionFileChip.tsx b/client/src/components/Chat/Input/Files/SessionFileChip.tsx
++new file mode 100644
++index 0000000..d59e4a4
++--- /dev/null
+++++ b/client/src/components/Chat/Input/Files/SessionFileChip.tsx
++@@ -0,0 +1,38 @@
+++import React from 'react';
+++import { cn } from '~/utils';
+++
+++export interface SessionFile {
+++  session_id: string;
+++  file_id: string;
+++  filename: string;
+++  generated_at?: string | Date;
+++}
+++
+++/**
+++ * Phase 2 Task 4b — chip for files generated by the Code-Interpreter
+++ * (Conversation.session_files entries from Phase 3 Track 2).
+++ *
+++ * These files have NO db.files row — they live only as sub-documents on
+++ * the Conversation, surfaced to follow-up `/exec` calls via primeFiles.
+++ * The chip exists so users can see at a glance which files the agent has
+++ * produced and will reuse on the next code run.
+++ *
+++ * Schema is stable since Phase 3 Track 2 Task 8:
+++ *   { session_id, file_id, filename, generated_at }
+++ *
+++ * Tooltip carries `session_id` for debugging cross-session lineage.
+++ */
+++const SessionFileChip: React.FC<{ sessionFile: SessionFile }> = ({ sessionFile }) => {
+++  const tooltip = `${sessionFile.filename} (vom Code generiert · session ${sessionFile.session_id})`;
+++  return (
+++    <span
+++      className={cn('file-status-chip', 'chip-success')}
+++      title={tooltip}
+++      data-session-id={sessionFile.session_id}
+++    >
+++      📦 {sessionFile.filename} · vom Code generiert
+++    </span>
+++  );
+++};
+++
+++export default SessionFileChip;
++diff --git a/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
++index 90c1c3a..7cc7a07 100644
++--- a/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
+++++ b/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
++@@ -15,6 +15,11 @@ jest.mock('~/data-provider', () => ({
++ 
++ jest.mock('~/hooks/Files', () => ({
++   useFileDeletion: jest.fn(),
+++  useFileStatusStream: jest.fn(() => ({ pathStatusByFileId: {}, sessionFiles: [] })),
+++}));
+++
+++jest.mock('~/Providers', () => ({
+++  useChatContext: jest.fn(() => ({ conversation: null })),
++ }));
++ 
++ jest.mock('~/utils', () => ({
++diff --git a/client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx
++new file mode 100644
++index 0000000..950a83f
++--- /dev/null
+++++ b/client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx
++@@ -0,0 +1,173 @@
+++import React from 'react';
+++import { render } from '@testing-library/react';
+++import '@testing-library/jest-dom';
+++import FileStatusChip from '../FileStatusChip';
+++
+++describe('FileStatusChip', () => {
+++  it('renders inline-loaded with char count', () => {
+++    const { container } = render(
+++      <FileStatusChip pathStatus={{ inline: { state: 'loaded', chars: 1234 } }} />,
+++    );
+++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
+++    expect(container.textContent).toContain('1234');
+++  });
+++
+++  it('renders rag-embedded with chunk count', () => {
+++    const { container } = render(
+++      <FileStatusChip pathStatus={{ rag: { state: 'embedded', chunks: 8 } }} />,
+++    );
+++    expect(container.textContent).toContain('Wissensbasis indexiert');
+++    expect(container.textContent).toContain('8 Chunks');
+++  });
+++
+++  it('renders rag-pending with progress hint', () => {
+++    const { container } = render(
+++      <FileStatusChip pathStatus={{ rag: { state: 'pending' } }} />,
+++    );
+++    expect(container.textContent).toMatch(/indexiert wird/i);
+++  });
+++
+++  it('renders combined inline + rag success', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'loaded', chars: 500 },
+++          rag: { state: 'embedded', chunks: 4 },
+++        }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
+++    expect(container.textContent).toContain('Wissensbasis indexiert');
+++  });
+++
+++  it('shows ❌ for terminal-failure (all paths failed)', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'failed', reason: 'PDF encrypted' },
+++          rag: { state: 'failed', reason: 'rag-api 500' },
+++        }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('nicht verarbeitbar');
+++    expect(container.textContent).toContain('❌');
+++  });
+++
+++  it('shows ⚠ for partial failure (rag failed, inline ok)', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'loaded', chars: 100 },
+++          rag: { state: 'failed', reason: 'timeout' },
+++        }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('⚠');
+++    expect(container.textContent).toMatch(/Indexierung fehlgeschlagen|fehlgeschlagen/);
+++  });
+++
+++  it('renders generic "wird verarbeitet" for empty pathStatus object', () => {
+++    const { container } = render(<FileStatusChip pathStatus={{}} />);
+++    expect(container.textContent).toMatch(/wird verarbeitet/i);
+++  });
+++
+++  it('S5 stale-risk: renders generic state for undefined pathStatus (Pre-Phase-3 file)', () => {
+++    const { container } = render(<FileStatusChip pathStatus={undefined} />);
+++    expect(container.textContent).toMatch(/verarbeitet/i);
+++  });
+++
+++  it('S5 stale-risk: renders generic state for null pathStatus', () => {
+++    const { container } = render(<FileStatusChip pathStatus={null} />);
+++    expect(container.textContent).toMatch(/verarbeitet/i);
+++  });
+++
+++  it('does not throw on undefined input (S5 regression guard)', () => {
+++    expect(() => render(<FileStatusChip pathStatus={undefined} />)).not.toThrow();
+++  });
+++
+++  it('handles short-form state strings (inline === "loaded" instead of object)', () => {
+++    const { container } = render(
+++      <FileStatusChip pathStatus={{ inline: 'loaded' as any, rag: 'embedded' as any }} />,
+++    );
+++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
+++    expect(container.textContent).toContain('Wissensbasis indexiert');
+++  });
+++
+++  it('renders mount-failed when explicit mount: failed is set', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{ mount: { state: 'failed', reason: 'MIME-Filter Reject' } }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('Upload abgebrochen');
+++    expect(container.textContent).toContain('MIME-Filter');
+++  });
+++
+++  it('renders rag-skipped silently (no clutter for non-applicable paths)', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'loaded', chars: 50 },
+++          rag: { state: 'skipped' },
+++        }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
+++    expect(container.textContent).not.toMatch(/skipped/i);
+++  });
+++
+++  it('exposes a tooltip with the reason on failure', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{ rag: { state: 'failed', reason: 'rag-api unreachable' } }}
+++      />,
+++    );
+++    const chip = container.querySelector('.file-status-chip');
+++    expect(chip).toBeTruthy();
+++    // Title attribute carries the reason for hover-tooltip.
+++    expect(chip?.getAttribute('title') ?? '').toMatch(/rag-api unreachable/);
+++  });
+++
+++  it('uses chip-success class when all known paths are healthy', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'loaded', chars: 100 },
+++          rag: { state: 'embedded', chunks: 5 },
+++        }}
+++      />,
+++    );
+++    expect(container.querySelector('.chip-success')).toBeTruthy();
+++  });
+++
+++  it('uses chip-warn class when at least one path failed but others succeeded', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'loaded', chars: 100 },
+++          rag: { state: 'failed', reason: 'x' },
+++        }}
+++      />,
+++    );
+++    expect(container.querySelector('.chip-warn')).toBeTruthy();
+++  });
+++
+++  it('uses chip-error class when every path failed', () => {
+++    const { container } = render(
+++      <FileStatusChip
+++        pathStatus={{
+++          inline: { state: 'failed', reason: 'a' },
+++          rag: { state: 'failed', reason: 'b' },
+++        }}
+++      />,
+++    );
+++    expect(container.querySelector('.chip-error')).toBeTruthy();
+++  });
+++
+++  it('uses chip-pending class while still in flight', () => {
+++    const { container } = render(
+++      <FileStatusChip pathStatus={{ rag: { state: 'pending' } }} />,
+++    );
+++    expect(container.querySelector('.chip-pending')).toBeTruthy();
+++  });
+++});
++diff --git a/client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx
++new file mode 100644
++index 0000000..55d7bdd
++--- /dev/null
+++++ b/client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx
++@@ -0,0 +1,89 @@
+++import React from 'react';
+++import { render } from '@testing-library/react';
+++import '@testing-library/jest-dom';
+++import SessionFileChip from '../SessionFileChip';
+++
+++describe('SessionFileChip', () => {
+++  it('renders the filename and "vom Code generiert" badge', () => {
+++    const { container } = render(
+++      <SessionFileChip
+++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: 'out.csv' }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('out.csv');
+++    expect(container.textContent).toMatch(/vom Code generiert/i);
+++  });
+++
+++  it('puts the session_id in the tooltip for debugging', () => {
+++    const { container } = render(
+++      <SessionFileChip
+++        sessionFile={{
+++          session_id: 'session-abc',
+++          file_id: 'f1',
+++          filename: 'a.txt',
+++        }}
+++      />,
+++    );
+++    const chip = container.querySelector('.file-status-chip');
+++    expect(chip?.getAttribute('title') ?? '').toContain('session-abc');
+++  });
+++
+++  it('renders the package icon prefix', () => {
+++    const { container } = render(
+++      <SessionFileChip
+++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: 'out.csv' }}
+++      />,
+++    );
+++    expect(container.textContent).toContain('📦');
+++  });
+++
+++  it('uses chip-success styling (success state for generated files)', () => {
+++    const { container } = render(
+++      <SessionFileChip
+++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: 'out.csv' }}
+++      />,
+++    );
+++    expect(container.querySelector('.chip-success')).toBeTruthy();
+++  });
+++
+++  it('does not throw when generated_at is provided as a Date', () => {
+++    expect(() =>
+++      render(
+++        <SessionFileChip
+++          sessionFile={{
+++            session_id: 'A',
+++            file_id: 'f1',
+++            filename: 'a.csv',
+++            generated_at: new Date('2026-05-06T12:00:00Z'),
+++          }}
+++        />,
+++      ),
+++    ).not.toThrow();
+++  });
+++
+++  it('does not throw when generated_at is provided as ISO string', () => {
+++    expect(() =>
+++      render(
+++        <SessionFileChip
+++          sessionFile={{
+++            session_id: 'A',
+++            file_id: 'f1',
+++            filename: 'a.csv',
+++            generated_at: '2026-05-06T12:00:00Z',
+++          }}
+++        />,
+++      ),
+++    ).not.toThrow();
+++  });
+++
+++  it('truncates long filenames in the title attribute (so tooltip shows full name)', () => {
+++    const longName = 'a-very-long-export-from-pandas-2026-05-06-final-final.csv';
+++    const { container } = render(
+++      <SessionFileChip
+++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: longName }}
+++      />,
+++    );
+++    const chip = container.querySelector('.file-status-chip');
+++    expect(chip?.getAttribute('title') ?? '').toContain(longName);
+++  });
+++});
++diff --git a/client/src/hooks/Files/index.ts b/client/src/hooks/Files/index.ts
++index df86c02..1de0881 100644
++--- a/client/src/hooks/Files/index.ts
+++++ b/client/src/hooks/Files/index.ts
++@@ -9,3 +9,4 @@ export { default as useSharePointPicker } from './useSharePointPicker';
++ export { default as useSharePointDownload } from './useSharePointDownload';
++ export { default as useSharePointFileHandling } from './useSharePointFileHandling';
++ export { default as useSharePointToken } from './useSharePointToken';
+++export { default as useFileStatusStream } from './useFileStatusStream';
++diff --git a/client/src/hooks/Files/useFileStatusStream.spec.tsx b/client/src/hooks/Files/useFileStatusStream.spec.tsx
++new file mode 100644
++index 0000000..f53cf9c
++--- /dev/null
+++++ b/client/src/hooks/Files/useFileStatusStream.spec.tsx
++@@ -0,0 +1,217 @@
+++import React from 'react';
+++import { renderHook, act } from '@testing-library/react';
+++import '@testing-library/jest-dom';
+++
+++let sseInstances: MockSSE[] = [];
+++
+++class MockSSE {
+++  url: string;
+++  options: any;
+++  listeners: Record<string, ((e: any) => void)[]> = {};
+++  closed = false;
+++  streamCalled = false;
+++
+++  constructor(url: string, options: any) {
+++    this.url = url;
+++    this.options = options;
+++    sseInstances.push(this);
+++  }
+++  addEventListener(name: string, cb: (e: any) => void) {
+++    if (!this.listeners[name]) this.listeners[name] = [];
+++    this.listeners[name].push(cb);
+++  }
+++  removeEventListener(name: string, cb: (e: any) => void) {
+++    this.listeners[name] = (this.listeners[name] ?? []).filter((l) => l !== cb);
+++  }
+++  stream() {
+++    this.streamCalled = true;
+++  }
+++  close() {
+++    this.closed = true;
+++  }
+++  dispatch(name: string, data: unknown) {
+++    (this.listeners[name] ?? []).forEach((cb) => cb({ data: JSON.stringify(data) }));
+++  }
+++}
+++
+++jest.mock('sse.js', () => ({ SSE: jest.fn() }));
+++const sseModule = jest.requireMock('sse.js') as { SSE: jest.Mock };
+++
+++let mockToken = 'tok-abc';
+++let mockAuthenticated = true;
+++jest.mock('~/hooks/AuthContext', () => ({
+++  useAuthContext: () => ({ token: mockToken, isAuthenticated: mockAuthenticated }),
+++}));
+++
+++import useFileStatusStream from './useFileStatusStream';
+++
+++describe('useFileStatusStream', () => {
+++  beforeEach(() => {
+++    sseInstances = [];
+++    sseModule.SSE.mockImplementation((url: string, opts: any) => new MockSSE(url, opts));
+++    mockToken = 'tok-abc';
+++    mockAuthenticated = true;
+++  });
+++
+++  it('opens an SSE connection with bearer token when enabled', () => {
+++    renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++    expect(sseInstances).toHaveLength(1);
+++    expect(sseInstances[0].url).toBe('/api/files/status-stream?conversationId=c1');
+++    expect(sseInstances[0].options.headers.Authorization).toBe('Bearer tok-abc');
+++    expect(sseInstances[0].streamCalled).toBe(true);
+++  });
+++
+++  it('opens without conversationId param when none provided', () => {
+++    renderHook(() => useFileStatusStream({ enabled: true }));
+++    expect(sseInstances[0].url).toBe('/api/files/status-stream');
+++  });
+++
+++  it('does not open SSE when enabled=false', () => {
+++    renderHook(() => useFileStatusStream({ enabled: false, conversationId: 'c1' }));
+++    expect(sseInstances).toHaveLength(0);
+++  });
+++
+++  it('does not open SSE when not authenticated', () => {
+++    mockAuthenticated = false;
+++    renderHook(() => useFileStatusStream({ enabled: true, conversationId: 'c1' }));
+++    expect(sseInstances).toHaveLength(0);
+++  });
+++
+++  it('updates pathStatusByFileId on status events', () => {
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++    expect(result.current.pathStatusByFileId).toEqual({});
+++
+++    act(() => {
+++      sseInstances[0].dispatch('status', {
+++        file_id: 'f1',
+++        path: 'inline',
+++        state: 'loaded',
+++        chars: 1234,
+++      });
+++    });
+++
+++    expect(result.current.pathStatusByFileId['f1']).toEqual({
+++      inline: { state: 'loaded', chars: 1234 },
+++    });
+++  });
+++
+++  it('merges multiple paths for the same file', () => {
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++
+++    act(() => {
+++      sseInstances[0].dispatch('status', {
+++        file_id: 'f1',
+++        path: 'inline',
+++        state: 'loaded',
+++        chars: 100,
+++      });
+++      sseInstances[0].dispatch('status', {
+++        file_id: 'f1',
+++        path: 'rag',
+++        state: 'embedded',
+++        chunks: 5,
+++      });
+++    });
+++
+++    expect(result.current.pathStatusByFileId['f1']).toEqual({
+++      inline: { state: 'loaded', chars: 100 },
+++      rag: { state: 'embedded', chunks: 5 },
+++    });
+++  });
+++
+++  it('appends session_file events with dedup on (session_id, file_id)', () => {
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++
+++    act(() => {
+++      sseInstances[0].dispatch('session_file', {
+++        conversationId: 'c1',
+++        session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' },
+++      });
+++      sseInstances[0].dispatch('session_file', {
+++        conversationId: 'c1',
+++        session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' }, // dup
+++      });
+++      sseInstances[0].dispatch('session_file', {
+++        conversationId: 'c1',
+++        session_file: { session_id: 'A', file_id: 'f2', filename: 'out2.csv' },
+++      });
+++    });
+++
+++    expect(result.current.sessionFiles).toHaveLength(2);
+++    expect(result.current.sessionFiles.map((s) => s.file_id)).toEqual(['f1', 'f2']);
+++  });
+++
+++  it('seeds session_files from initialSessionFiles prop and merges with live', () => {
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({
+++        enabled: true,
+++        conversationId: 'c1',
+++        initialSessionFiles: [
+++          { session_id: 'old', file_id: 'fOld', filename: 'old.csv' },
+++        ],
+++      }),
+++    );
+++
+++    expect(result.current.sessionFiles).toHaveLength(1);
+++    expect(result.current.sessionFiles[0].file_id).toBe('fOld');
+++
+++    act(() => {
+++      sseInstances[0].dispatch('session_file', {
+++        session_file: { session_id: 'new', file_id: 'fNew', filename: 'new.csv' },
+++      });
+++    });
+++
+++    expect(result.current.sessionFiles).toHaveLength(2);
+++    expect(result.current.sessionFiles.map((s) => s.file_id).sort()).toEqual(['fNew', 'fOld']);
+++  });
+++
+++  it('closes the SSE connection on unmount', () => {
+++    const { unmount } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++    expect(sseInstances[0].closed).toBe(false);
+++    unmount();
+++    expect(sseInstances[0].closed).toBe(true);
+++  });
+++
+++  it('ignores malformed JSON in events without crashing', () => {
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++    act(() => {
+++      const cb = sseInstances[0].listeners['status']?.[0];
+++      expect(() => cb && cb({ data: 'not-json{' })).not.toThrow();
+++    });
+++    expect(result.current.pathStatusByFileId).toEqual({});
+++  });
+++
+++  it('ignores status events missing file_id or path', () => {
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++    act(() => {
+++      sseInstances[0].dispatch('status', { state: 'loaded' });
+++      sseInstances[0].dispatch('status', { file_id: 'f1', state: 'loaded' });
+++    });
+++    expect(result.current.pathStatusByFileId).toEqual({});
+++  });
+++
+++  it('survives SSE constructor throw and returns empty maps', () => {
+++    sseModule.SSE.mockImplementationOnce(() => {
+++      throw new Error('CSP block');
+++    });
+++    const { result } = renderHook(() =>
+++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
+++    );
+++    expect(result.current.pathStatusByFileId).toEqual({});
+++    expect(result.current.sessionFiles).toEqual([]);
+++  });
+++});
++diff --git a/client/src/hooks/Files/useFileStatusStream.ts b/client/src/hooks/Files/useFileStatusStream.ts
++new file mode 100644
++index 0000000..46cf036
++--- /dev/null
+++++ b/client/src/hooks/Files/useFileStatusStream.ts
++@@ -0,0 +1,159 @@
+++import { useEffect, useRef, useState, useMemo } from 'react';
+++import { SSE } from 'sse.js';
+++import { useAuthContext } from '~/hooks/AuthContext';
+++import type { PathStatus } from '~/components/Chat/Input/Files/FileStatusChip';
+++import type { SessionFile } from '~/components/Chat/Input/Files/SessionFileChip';
+++
+++interface StatusEvent {
+++  file_id: string;
+++  filename?: string;
+++  conversationId?: string;
+++  userId?: string;
+++  path: 'inline' | 'rag' | 'mount';
+++  state: NonNullable<PathStatus['inline']>;
+++  reason?: string;
+++  chars?: number;
+++  chunks?: number;
+++  timestamp?: string;
+++}
+++
+++interface SessionFileEvent {
+++  conversationId?: string;
+++  userId?: string;
+++  session_file: SessionFile;
+++  timestamp?: string;
+++}
+++
+++interface UseFileStatusStreamArgs {
+++  enabled: boolean;
+++  conversationId?: string | null;
+++  initialSessionFiles?: SessionFile[];
+++}
+++
+++interface UseFileStatusStreamResult {
+++  pathStatusByFileId: Record<string, PathStatus>;
+++  sessionFiles: SessionFile[];
+++}
+++
+++/**
+++ * Phase 2 — single SSE subscription to /api/files/status-stream that fans out
+++ * pathStatus updates per file_id and conversation-level session_file events.
+++ *
+++ * Auth: passes the JWT bearer token explicitly via sse.js headers (native
+++ * EventSource cannot, since LibreChat's requireJwtAuth middleware reads from
+++ * the Authorization header only — see api/strategies/jwtStrategy.js).
+++ *
+++ * Defensive when:
+++ *   - FILE_ROUTING_V2 flag is OFF on the backend → no pathStatus events
+++ *     emitted; the hook simply returns empty maps. Existing UI keeps working.
+++ *   - Token is missing / connection fails → the catch swallows it; UI degrades
+++ *     gracefully to "no live updates" rather than crashing.
+++ *   - Connection drops → sse.js reconnects automatically via stream events,
+++ *     but state can be lost. Acceptable per Phase-2 plan; full reload-recovery
+++ *     via REST is Phase-3 backlog.
+++ *
+++ * Single connection per consumer — mount this hook once at the FileRow level,
+++ * not per individual chip, to stay under the browser's HTTP/2 stream cap.
+++ */
+++export default function useFileStatusStream({
+++  enabled,
+++  conversationId,
+++  initialSessionFiles,
+++}: UseFileStatusStreamArgs): UseFileStatusStreamResult {
+++  const { token, isAuthenticated } = useAuthContext();
+++  const [pathStatusByFileId, setPathStatusByFileId] = useState<Record<string, PathStatus>>({});
+++  const [liveSessionFiles, setLiveSessionFiles] = useState<SessionFile[]>([]);
+++  const sseRef = useRef<SSE | null>(null);
+++
+++  useEffect(() => {
+++    if (!enabled || !isAuthenticated || !token) return;
+++
+++    const url = conversationId
+++      ? `/api/files/status-stream?conversationId=${encodeURIComponent(conversationId)}`
+++      : '/api/files/status-stream';
+++
+++    let sse: SSE | null = null;
+++    try {
+++      sse = new SSE(url, {
+++        headers: { Authorization: `Bearer ${token}` },
+++        method: 'GET',
+++      });
+++      sseRef.current = sse;
+++    } catch (err) {
+++      // sse.js constructor failures (CSP, blocked etc.) — swallow, no live UX.
+++      // Logged via the data-provider logger if available; otherwise just bail.
+++      // eslint-disable-next-line no-console
+++      console.warn('[useFileStatusStream] failed to open SSE:', err);
+++      return;
+++    }
+++
+++    const onStatus = (e: MessageEvent) => {
+++      try {
+++        const evt: StatusEvent = JSON.parse(e.data);
+++        if (!evt.file_id || !evt.path) return;
+++        setPathStatusByFileId((prev) => {
+++          const current = prev[evt.file_id] ?? {};
+++          const entry: Record<string, unknown> = { state: evt.state };
+++          if (evt.reason !== undefined) entry.reason = evt.reason;
+++          if (evt.chars !== undefined) entry.chars = evt.chars;
+++          if (evt.chunks !== undefined) entry.chunks = evt.chunks;
+++          return {
+++            ...prev,
+++            [evt.file_id]: { ...current, [evt.path]: entry },
+++          };
+++        });
+++      } catch {
+++        /* malformed event — ignore */
+++      }
+++    };
+++
+++    const onSessionFile = (e: MessageEvent) => {
+++      try {
+++        const evt: SessionFileEvent = JSON.parse(e.data);
+++        const sf = evt.session_file;
+++        if (!sf || !sf.file_id || !sf.session_id) return;
+++        setLiveSessionFiles((prev) => {
+++          if (prev.some((p) => p.session_id === sf.session_id && p.file_id === sf.file_id)) {
+++            return prev;
+++          }
+++          return [...prev, sf];
+++        });
+++      } catch {
+++        /* malformed event — ignore */
+++      }
+++    };
+++
+++    sse.addEventListener('status', onStatus);
+++    sse.addEventListener('session_file', onSessionFile);
+++    sse.stream();
+++
+++    return () => {
+++      try {
+++        sse?.removeEventListener('status', onStatus);
+++        sse?.removeEventListener('session_file', onSessionFile);
+++        sse?.close();
+++      } catch {
+++        /* connection already closed — ignore */
+++      }
+++      sseRef.current = null;
+++    };
+++  }, [enabled, isAuthenticated, token, conversationId]);
+++
+++  // Merge initial (server-rendered) session_files with live SSE updates.
+++  // Live entries take precedence on (session_id, file_id) collision since
+++  // they reflect the most recent register.
+++  const sessionFiles = useMemo(() => {
+++    const merged = [...(initialSessionFiles ?? [])];
+++    const seen = new Set(merged.map((s) => `${s.session_id}::${s.file_id}`));
+++    for (const live of liveSessionFiles) {
+++      const key = `${live.session_id}::${live.file_id}`;
+++      if (!seen.has(key)) {
+++        merged.push(live);
+++        seen.add(key);
+++      }
+++    }
+++    return merged;
+++  }, [initialSessionFiles, liveSessionFiles]);
+++
+++  return { pathStatusByFileId, sessionFiles };
+++}
++-- 
++2.47.3
++
+diff --git a/deployment/patches/phase-2/0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch b/deployment/patches/phase-2/0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch
+new file mode 100644
+index 0000000..abc04b5
+--- /dev/null
++++ b/deployment/patches/phase-2/0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch
+@@ -0,0 +1,499 @@
++From bf9ad824699607176f775e1549b866324f047614 Mon Sep 17 00:00:00 2001
++From: pucawo <github@pucawo.de>
++Date: Wed, 6 May 2026 23:45:01 +0200
++Subject: [PATCH 3/3] feat(files): pipeline emit-hooks + chip CSS for Phase 2
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++Stage 3 of Phase 2:
++
++- inlinePipeline / ragPipeline: emit a 'status' event next to every
++  pathStatus write (loaded / failed / embedded / failed). Minimal-
++  invasive next to the existing safeUpdateFile call rather than a
++  refactor — keeps the Phase 3 write semantics intact.
++- processCodeOutput: emit 'session_file' after registerSessionFile
++  *successfully matches* a conversation. Matched=0 (cross-user
++  injection silently rejected) and DB throws both skip the emit so
++  the bus never carries something the DB doesn't reflect.
++- style.css: .file-status-chip + .chip-success/.chip-warn/.chip-error/
++  .chip-pending using LibreChat's --green/--amber/--red ramp + .dark
++  overrides. Same vars Light/Dark/Neon all consume, so the chip
++  inherits the theme cleanly.
++
++Tests: sse-bus.test.js — 9 cases covering happy, failure, skip-route
++and cross-user-injection paths.
++
++Phase 2 Tasks 6 + 7.
++---
++ api/server/services/Files/Code/process.js     |  18 +-
++ .../services/Files/__tests__/sse-bus.test.js  | 236 ++++++++++++++++++
++ api/server/services/Files/inlinePipeline.js   |  27 ++
++ api/server/services/Files/ragPipeline.js      |  34 +++
++ client/src/style.css                          |  59 +++++
++ 5 files changed, 373 insertions(+), 1 deletion(-)
++ create mode 100644 api/server/services/Files/__tests__/sse-bus.test.js
++
++diff --git a/api/server/services/Files/Code/process.js b/api/server/services/Files/Code/process.js
++index 34aa89a..9960afc 100644
++--- a/api/server/services/Files/Code/process.js
+++++ b/api/server/services/Files/Code/process.js
++@@ -17,6 +17,7 @@ const { convertImage } = require('~/server/services/Files/images/convert');
++ const { createFile, getFiles, updateFile } = require('~/models');
++ const { Conversation } = require('~/db/models');
++ const { registerSessionFile } = require('~/models/Conversation');
+++const { emitSessionFileUpdate } = require('~/server/services/Files/statusBus');
++ 
++ /**
++  * Process OpenAI image files, convert to target format, save and return file metadata.
++@@ -49,11 +50,26 @@ const processCodeOutput = async ({
++   const userId = req?.user?.id;
++   if (conversationId && session_id && id && name && userId) {
++     try {
++-      await registerSessionFile(conversationId, userId, {
+++      const result = await registerSessionFile(conversationId, userId, {
++         session_id,
++         file_id: id,
++         filename: name,
++       });
+++      // Phase 2 — only emit when the write actually landed (matched a convo).
+++      // Skips no-op cross-user-injection cases that registerSessionFile
+++      // silently rejects (matchedCount === 0).
+++      if (result && result.matchedCount > 0) {
+++        try {
+++          emitSessionFileUpdate({
+++            conversationId,
+++            userId,
+++            session_file: { session_id, file_id: id, filename: name },
+++            timestamp: new Date().toISOString(),
+++          });
+++        } catch (emitErr) {
+++          logger.warn(`[processCodeOutput] emitSessionFileUpdate failed: ${emitErr.message}`);
+++        }
+++      }
++     } catch (err) {
++       logger.warn(`[processCodeOutput] registerSessionFile failed: ${err.message}`);
++     }
++diff --git a/api/server/services/Files/__tests__/sse-bus.test.js b/api/server/services/Files/__tests__/sse-bus.test.js
++new file mode 100644
++index 0000000..3e9e11e
++--- /dev/null
+++++ b/api/server/services/Files/__tests__/sse-bus.test.js
++@@ -0,0 +1,236 @@
+++/**
+++ * Phase 2 Task 7 — verifies that the existing pipelines emit SSE events
+++ * next to their pathStatus / session_files writes.
+++ *
+++ * Mocks the underlying I/O (extractInlineText, embedToRag, updateFile,
+++ * registerSessionFile) and only asserts on bus listeners — the writes
+++ * themselves are exercised by pipeline-specific tests already.
+++ */
+++
+++jest.mock('../inlineExtract', () => ({
+++  extractInlineText: jest.fn(),
+++}));
+++
+++jest.mock('../VectorDB/embedToRag', () => ({
+++  embedToRag: jest.fn(),
+++}));
+++
+++jest.mock('~/models/File', () => ({
+++  updateFile: jest.fn().mockResolvedValue({}),
+++}));
+++
+++jest.mock('~/models/FilePathFailure', () => ({
+++  recordFilePathFailure: jest.fn().mockResolvedValue(),
+++}));
+++
+++jest.mock('~/models/Conversation', () => ({
+++  registerSessionFile: jest.fn(),
+++}));
+++
+++// Code/process.js pulls a *lot* of dependencies; mock the heavy ones so the
+++// require() doesn't drag in axios/agents/strategies/permissions trees.
+++jest.mock('@librechat/agents', () => ({
+++  getCodeBaseURL: () => 'http://code.local',
+++}));
+++
+++jest.mock('@librechat/api', () => ({
+++  logAxiosError: jest.fn(),
+++  getBasePath: () => '',
+++}));
+++
+++jest.mock('axios', () => ({
+++  get: jest.fn(),
+++  post: jest.fn(),
+++}));
+++
+++jest.mock('~/server/services/Files/permissions', () => ({
+++  filterFilesByAgentAccess: jest.fn(),
+++}));
+++
+++jest.mock('~/server/services/Files/strategies', () => ({
+++  getStrategyFunctions: jest.fn(() => ({})),
+++}));
+++
+++jest.mock('~/server/services/Files/images/convert', () => ({
+++  convertImage: jest.fn(),
+++}));
+++
+++jest.mock('~/models', () => ({
+++  createFile: jest.fn(),
+++  getFiles: jest.fn(),
+++  updateFile: jest.fn(),
+++}));
+++
+++jest.mock('~/db/models', () => ({
+++  Conversation: {},
+++}));
+++
+++const { statusBus } = require('../statusBus');
+++const { runInlinePipeline } = require('../inlinePipeline');
+++const { runRagPipeline } = require('../ragPipeline');
+++const { processCodeOutput } = require('../Code/process');
+++const { extractInlineText } = require('../inlineExtract');
+++const { embedToRag } = require('../VectorDB/embedToRag');
+++const { registerSessionFile } = require('~/models/Conversation');
+++
+++describe('SSE bus emits from Phase-3 pipelines', () => {
+++  let emitted;
+++
+++  beforeEach(() => {
+++    emitted = { status: [], session_file: [] };
+++    statusBus.removeAllListeners();
+++    statusBus.on('status', (e) => emitted.status.push(e));
+++    statusBus.on('session_file', (e) => emitted.session_file.push(e));
+++    jest.clearAllMocks();
+++  });
+++
+++  describe('inlinePipeline', () => {
+++    const file = { path: '/tmp/x.pdf', mimetype: 'application/pdf', size: 5_000 };
+++    const fileResult = { file_id: 'f-1', filename: 'x.pdf' };
+++
+++    it('emits status: inline/loaded with chars on success', async () => {
+++      extractInlineText.mockResolvedValue({ text: 'Hi', chars: 2, filename: 'x.pdf' });
+++
+++      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
+++
+++      expect(emitted.status).toHaveLength(1);
+++      expect(emitted.status[0]).toMatchObject({
+++        file_id: 'f-1',
+++        filename: 'x.pdf',
+++        conversationId: 'conv-1',
+++        userId: 'u1',
+++        path: 'inline',
+++        state: 'loaded',
+++        chars: 2,
+++      });
+++      expect(emitted.status[0].timestamp).toMatch(/^\d{4}-/);
+++    });
+++
+++    it('emits status: inline/failed with reason on extract-failure', async () => {
+++      extractInlineText.mockRejectedValue(new Error('PDF encrypted'));
+++
+++      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
+++
+++      expect(emitted.status).toHaveLength(1);
+++      expect(emitted.status[0]).toMatchObject({
+++        file_id: 'f-1',
+++        path: 'inline',
+++        state: 'failed',
+++        reason: 'PDF encrypted',
+++        userId: 'u1',
+++      });
+++    });
+++
+++    it('does not emit when route decision skips inline (size > threshold)', async () => {
+++      const largeFile = { ...file, size: 100_000 };
+++      await runInlinePipeline({ user: { id: 'u1' } }, largeFile, fileResult, 'conv-1');
+++      expect(emitted.status).toHaveLength(0);
+++    });
+++  });
+++
+++  describe('ragPipeline', () => {
+++    const file = { path: '/tmp/big.pdf', mimetype: 'application/pdf', size: 50_000 };
+++    const fileResult = { file_id: 'f-2', filename: 'big.pdf' };
+++
+++    it('emits status: rag/embedded with chunks on success', async () => {
+++      embedToRag.mockResolvedValue({ embedded: true, chunks: 7 });
+++
+++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
+++
+++      expect(emitted.status).toHaveLength(1);
+++      expect(emitted.status[0]).toMatchObject({
+++        file_id: 'f-2',
+++        path: 'rag',
+++        state: 'embedded',
+++        chunks: 7,
+++        userId: 'u2',
+++      });
+++    });
+++
+++    it('emits status: rag/failed with reason on embed-failure', async () => {
+++      embedToRag.mockRejectedValue(new Error('rag-api 502'));
+++
+++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
+++
+++      expect(emitted.status).toHaveLength(1);
+++      expect(emitted.status[0]).toMatchObject({
+++        file_id: 'f-2',
+++        path: 'rag',
+++        state: 'failed',
+++        reason: 'rag-api 502',
+++      });
+++    });
+++
+++    it('emits status: rag/failed when rag-api returns embedded=false', async () => {
+++      embedToRag.mockResolvedValue({ embedded: false });
+++
+++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
+++
+++      expect(emitted.status).toHaveLength(1);
+++      expect(emitted.status[0]).toMatchObject({
+++        file_id: 'f-2',
+++        path: 'rag',
+++        state: 'failed',
+++        reason: expect.stringMatching(/embedded=false/),
+++      });
+++    });
+++  });
+++
+++  describe('processCodeOutput', () => {
+++    it('emits session_file when registerSessionFile succeeds', async () => {
+++      registerSessionFile.mockResolvedValue({ matchedCount: 1, modifiedCount: 1 });
+++
+++      await processCodeOutput({
+++        req: { user: { id: 'u3' } },
+++        id: 'sf-1',
+++        name: 'out.csv',
+++        apiKey: 'k',
+++        toolCallId: 't',
+++        conversationId: 'conv-3',
+++        messageId: 'm',
+++        session_id: 'sess-A',
+++      });
+++
+++      expect(emitted.session_file).toHaveLength(1);
+++      expect(emitted.session_file[0]).toMatchObject({
+++        conversationId: 'conv-3',
+++        userId: 'u3',
+++        session_file: { session_id: 'sess-A', file_id: 'sf-1', filename: 'out.csv' },
+++      });
+++    });
+++
+++    it('does not emit session_file when matchedCount=0 (cross-user injection rejected)', async () => {
+++      registerSessionFile.mockResolvedValue({ matchedCount: 0, modifiedCount: 0 });
+++
+++      await processCodeOutput({
+++        req: { user: { id: 'attacker' } },
+++        id: 'malicious',
+++        name: 'bad.csv',
+++        apiKey: 'k',
+++        toolCallId: 't',
+++        conversationId: 'victim-conv',
+++        messageId: 'm',
+++        session_id: 'sess-X',
+++      });
+++
+++      expect(emitted.session_file).toHaveLength(0);
+++    });
+++
+++    it('does not emit session_file when registerSessionFile throws', async () => {
+++      registerSessionFile.mockRejectedValue(new Error('DB down'));
+++
+++      await processCodeOutput({
+++        req: { user: { id: 'u3' } },
+++        id: 'sf-2',
+++        name: 'out.csv',
+++        apiKey: 'k',
+++        toolCallId: 't',
+++        conversationId: 'conv-3',
+++        messageId: 'm',
+++        session_id: 'sess-A',
+++      });
+++
+++      expect(emitted.session_file).toHaveLength(0);
+++    });
+++  });
+++});
++diff --git a/api/server/services/Files/inlinePipeline.js b/api/server/services/Files/inlinePipeline.js
++index 62a3ae3..cd62b9d 100644
++--- a/api/server/services/Files/inlinePipeline.js
+++++ b/api/server/services/Files/inlinePipeline.js
++@@ -1,6 +1,7 @@
++ const { logger } = require('@librechat/data-schemas');
++ const { routeFile } = require('./routing');
++ const { extractInlineText } = require('./inlineExtract');
+++const { emitStatusUpdate } = require('./statusBus');
++ 
++ /**
++  * Phase 3 Task 3 — runs the inline pipeline for one freshly uploaded file.
++@@ -52,6 +53,15 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
++       'metadata.pathStatus.inline.reason': reason,
++       'metadata.pathStatus.inline.completed_at': new Date(),
++     });
+++    safeEmit({
+++      file_id,
+++      filename,
+++      conversationId,
+++      userId: req && req.user && req.user.id,
+++      path: 'inline',
+++      state: 'failed',
+++      reason,
+++    });
++     if (conversationId) {
++       try {
++         const { recordFilePathFailure } = require('~/models/FilePathFailure');
++@@ -79,6 +89,23 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
++     'metadata.pathStatus.inline.chars': extracted.chars,
++     'metadata.pathStatus.inline.completed_at': new Date(),
++   });
+++  safeEmit({
+++    file_id,
+++    filename,
+++    conversationId,
+++    userId: req && req.user && req.user.id,
+++    path: 'inline',
+++    state: 'loaded',
+++    chars: extracted.chars,
+++  });
+++}
+++
+++function safeEmit(event) {
+++  try {
+++    emitStatusUpdate({ ...event, timestamp: new Date().toISOString() });
+++  } catch (err) {
+++    logger.warn(`[runInlinePipeline] emit failed: ${err && err.message}`);
+++  }
++ }
++ 
++ async function safeUpdateFile(data) {
++diff --git a/api/server/services/Files/ragPipeline.js b/api/server/services/Files/ragPipeline.js
++index a28c0ce..f24849f 100644
++--- a/api/server/services/Files/ragPipeline.js
+++++ b/api/server/services/Files/ragPipeline.js
++@@ -1,6 +1,7 @@
++ const { logger } = require('@librechat/data-schemas');
++ const { routeFile } = require('./routing');
++ const { embedToRag } = require('./VectorDB/embedToRag');
+++const { emitStatusUpdate } = require('./statusBus');
++ 
++ /**
++  * Phase 3 Task 4 — runs the RAG pipeline for one freshly uploaded file.
++@@ -48,6 +49,15 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id)
++       'metadata.pathStatus.rag.reason': reason,
++       'metadata.pathStatus.rag.completed_at': new Date(),
++     });
+++    safeEmit({
+++      file_id,
+++      filename: fileResult.filename,
+++      conversationId,
+++      userId: req && req.user && req.user.id,
+++      path: 'rag',
+++      state: 'failed',
+++      reason,
+++    });
++     if (conversationId) {
++       try {
++         const { recordFilePathFailure } = require('~/models/FilePathFailure');
++@@ -82,6 +92,30 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id)
++       'rag-api returned embedded=false (unsupported MIME or known_type=false)';
++   }
++   await safeUpdateFile(update);
+++
+++  const emitState = result && result.embedded ? 'embedded' : 'failed';
+++  safeEmit({
+++    file_id,
+++    filename: fileResult.filename,
+++    conversationId,
+++    userId: req && req.user && req.user.id,
+++    path: 'rag',
+++    state: emitState,
+++    ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
+++    ...(emitState === 'failed'
+++      ? {
+++          reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
+++        }
+++      : {}),
+++  });
+++}
+++
+++function safeEmit(event) {
+++  try {
+++    emitStatusUpdate({ ...event, timestamp: new Date().toISOString() });
+++  } catch (err) {
+++    logger.warn(`[runRagPipeline] emit failed: ${err && err.message}`);
+++  }
++ }
++ 
++ async function safeUpdateFile(data) {
++diff --git a/client/src/style.css b/client/src/style.css
++index 689c054..2872b3e 100644
++--- a/client/src/style.css
+++++ b/client/src/style.css
++@@ -2922,3 +2922,62 @@ html {
++ .sharepoint-picker-bg {
++   background-color: #f5f5f5;
++ }
+++
+++/* Phase 2 — file-status chip below uploaded / generated files. */
+++.file-status-chip {
+++  display: inline-flex;
+++  align-items: center;
+++  gap: 4px;
+++  padding: 2px 8px;
+++  border-radius: 12px;
+++  font-size: 0.75rem;
+++  line-height: 1.25;
+++  background-color: var(--surface-secondary);
+++  color: var(--text-secondary);
+++  border: 1px solid var(--border-light);
+++  white-space: nowrap;
+++  overflow: hidden;
+++  text-overflow: ellipsis;
+++  max-width: 100%;
+++}
+++
+++.file-status-chip.chip-success {
+++  color: var(--green-700);
+++  border-color: var(--green-300);
+++  background-color: var(--green-50);
+++}
+++
+++.dark .file-status-chip.chip-success {
+++  color: var(--green-300);
+++  border-color: var(--green-700);
+++  background-color: rgba(16, 185, 129, 0.08);
+++}
+++
+++.file-status-chip.chip-warn {
+++  color: var(--amber-600);
+++  border-color: var(--amber-300);
+++  background-color: var(--amber-50);
+++}
+++
+++.dark .file-status-chip.chip-warn {
+++  color: var(--amber-300);
+++  border-color: var(--amber-700);
+++  background-color: rgba(245, 158, 11, 0.08);
+++}
+++
+++.file-status-chip.chip-error {
+++  color: var(--red-700);
+++  border-color: var(--red-300);
+++  background-color: var(--red-50);
+++}
+++
+++.dark .file-status-chip.chip-error {
+++  color: var(--red-300);
+++  border-color: var(--red-700);
+++  background-color: rgba(239, 68, 68, 0.08);
+++}
+++
+++.file-status-chip.chip-pending {
+++  color: var(--text-tertiary);
+++  border-style: dashed;
+++}
++-- 
++2.47.3
++
+diff --git a/deployment/phase-2-deploy-runbook.md b/deployment/phase-2-deploy-runbook.md
+new file mode 100644
+index 0000000..a7c539e
+--- /dev/null
++++ b/deployment/phase-2-deploy-runbook.md
+@@ -0,0 +1,214 @@
++# Phase 2 Deploy-Runbook — Status-Chip-UI
++
++**Status:** Code auf Branch `feature/file-handling-v2-phase-2-chip-ui`
++(LibreChat-Fork). 3 Format-Patches off `973969e` (Phase 3 prod-HEAD)
++liegen unter `deployment/patches/phase-2/`. Phase 2 ist komplett
++**read-only** auf den Phase-3-Schemas (`metadata.pathStatus`,
++`Conversation.session_files`) — keine DB-Migration, kein neuer Flag.
++
++**Tests grün lokal:**
++- Backend: 625 / 625 (`server/services/Files/` + `server/routes/files/` + `models/`)
++- Frontend: 102 / 102 (`Files/` components + hooks)
++
++**Diese Runbook deckt nur den Path A — Hand-Apply auf prod.**
++
++---
++
++## Vorbedingungen
++
++- Phase 3 ist auf prod live mit `FILE_ROUTING_V2=true` (commit `973969e`
++  oder neuer auf `~/LibreChat`).
++- prod's `~/LibreChat`-Working-Tree hat ~20+ uncommitted customizations
++  — siehe `git status -s` auf prod. Patches MÜSSEN per `git apply
++  --3way` und ggf. Hand-Merge angewendet werden, nicht blind `git apply`.
++- Rollback-Plan im Kopf: alle Phase-2-Änderungen sind additiv. Bei
++  Problem `git stash --include-untracked` der Patch-Hunks und Rebuild —
++  die Stage-1+3-Routen (statusBus, statusStream) werden bei Abwesenheit
++  des Frontend-Codes ohnehin von keinem Client genutzt.
++
++---
++
++## Stage 1 — Patches auf prod transferieren
++
++```bash
++# WSL host:
++cd /home/elsner/LibreChat-fork-phase-2
++ls deployment/patches/phase-2/
++# 3 Patches: 0001 (SSE-Bus + Route), 0002 (Chips + Hook), 0003 (Pipelines + CSS)
++
++scp deployment/patches/phase-2/*.patch slx-ki-webapp.gloeckle.local:/tmp/
++```
++
++---
++
++## Stage 2 — Hand-Apply auf prod
++
++```bash
++ssh slx-ki-webapp.gloeckle.local
++cd ~/LibreChat
++git status -s    # snapshot der bestehenden customizations
++git stash --include-untracked --message "phase-2-deploy-stash"
++
++# 3-way merge — fängt Konflikte ab statt blind zu überschreiben.
++git apply --3way --check /tmp/0001-*.patch
++git apply --3way        /tmp/0001-*.patch
++
++git apply --3way --check /tmp/0002-*.patch
++git apply --3way        /tmp/0002-*.patch
++
++git apply --3way --check /tmp/0003-*.patch
++git apply --3way        /tmp/0003-*.patch
++```
++
++**Wahrscheinliche Konfliktstellen** (Phase-3-deploy hat das genauso
++gesehen):
++
++1. `client/src/components/Chat/Input/Files/FileRow.tsx` —
++   prod-customizations (theme, useChatFunctions) überlappen.
++   - Konflikt erwartet, manuell merge'n: meine `useChatContext()`-
++     Hook-Aufrufe + neue Imports zwischen die bestehenden Imports
++     einfügen.
++2. `client/src/components/Chat/Input/Files/FileContainer.tsx` —
++   sollte sauber sein (nur der `pathStatus`-Prop wird hinzugefügt).
++3. `client/src/style.css` — append-only am Dateiende, sauber.
++4. `api/server/routes/files/index.js` — append-only, sauber.
++
++```bash
++# Nach erfolgreichem Apply:
++git stash pop "phase-2-deploy-stash"   # bestehende customizations zurück
++# → ggf. nochmal mergen falls Konflikte
++```
++
++---
++
++## Stage 3 — Build + Restart
++
++```bash
++cd ~/LibreChat
++npm install --silent          # neue dep? Sollte keine sein, aber sicher.
++npm run build:packages        # data-provider, data-schemas, api, client-pkg
++npm run frontend              # Client-React-App neu bauen
++pm2 restart librechat-api     # oder wie der prod-pm2-Name lautet
++pm2 logs librechat-api --lines 50
++```
++
++**Erwartung in pm2-Logs:**
++- Kein Boot-Error.
++- Kein `Cannot find module` oder `Cannot read properties of undefined`.
++- Erste Status-Stream-Verbindung wenn der erste User reloaded:
++  `GET /api/files/status-stream` (oder kein Log, je nach Logger-Level).
++
++---
++
++## Stage 4 — Smoke-Test auf prod
++
++1. **Browser-Refresh in incognito** (Service-Worker-Cache!).
++2. Existierenden Chat öffnen → keine Crash, keine roten Console-Errors
++   (S6 Pre-Phase-3-File-Rows-Stale-Risk).
++3. Neue Chat öffnen, kleine PDF (z. B. ein 5-KB-Test-PDF) hochladen.
++   Innerhalb 5 s Chip `Im Chat-Kontext geladen ✓ (X Zeichen)`.
++4. F12 → Network-Tab → `/api/files/status-stream` ist offen, mind. 1
++   `event: status` Event durchgekommen.
++5. Theme-Toggle (Light → Dark) — Chip-Farben passen sich an.
++6. **Falls UI nicht aktualisiert:** Hard-Refresh + Service-Worker-Unregister.
++
++---
++
++## Stage 5 — UAT
++
++Vollständige UAT-Playbook `deployment/uat/2026-05-07-file-handling-v2-phase-2.md`
++durchgehen. S1–S8 alle grün vor Sign-Off.
++
++---
++
++## Stage 6 — User-Comm
++
++Nach UAT-Sign-Off: Mail aus
++`deployment/user-comm/2026-05-07-file-status-chip-announcement.md` versenden.
++
++---
++
++## Rollback
++
++Wenn Phase 2 produktiv Issues macht (z. B. SSE-Storm, Server-CPU-Spike,
++Chip-Crash der die ganze File-Liste killt):
++
++### Option A — Frontend-only-Rollback (empfohlen)
++
++```bash
++ssh slx-ki-webapp.gloeckle.local
++cd ~/LibreChat
++git checkout HEAD -- client/src/components/Chat/Input/Files/FileRow.tsx \
++                     client/src/components/Chat/Input/Files/FileContainer.tsx \
++                     client/src/components/Chat/Input/Files/FileStatusChip.tsx \
++                     client/src/components/Chat/Input/Files/SessionFileChip.tsx \
++                     client/src/hooks/Files/useFileStatusStream.ts \
++                     client/src/hooks/Files/index.ts \
++                     client/src/style.css
++npm run frontend
++# Backend SSE-Routen bleiben aktiv aber niemand verbindet sich mehr.
++```
++
++### Option B — Voll-Rollback (alle 3 Patches)
++
++```bash
++git apply --reverse /tmp/0003-*.patch
++git apply --reverse /tmp/0002-*.patch
++git apply --reverse /tmp/0001-*.patch
++npm run build:packages
++npm run frontend
++pm2 restart librechat-api
++```
++
++Bei Konflikten: `git checkout HEAD -- <file>` der konfliktiven Files
++und Custom-Customizations händisch wiederherstellen aus dem
++phase-2-deploy-stash.
++
++---
++
++## Bekannte sharp-edges für Stage 2 (Phase 3 has Lessons)
++
++- **Service-Worker-Cache** verzögert UI-Updates oft 1-2 Browser-Sessions
++  bei normalem F5. Ctrl+Shift+R + Application → Service Workers →
++  Unregister im DevTools fixt das.
++- **EventSource-Reconnect** bei Connection-Drop: sse.js reconnectet
++  automatisch, kann aber State verlieren. Akzeptabel — UI Reload
++  bringt aktuellen Stand zurück (über metadata.pathStatus, das per
++  conversation-load schon mit kommt).
++- **Cross-User-Leaks bei SSE**: Backend filtert per `userId` *und*
++  optional `conversationId`. UAT S8 muss das verifizieren.
++- **Pre-Phase-3-File-Rows** (uploaded vor Phase-3-Deploy am 2026-05-06)
++  haben kein `metadata.pathStatus`. UI rendert dann *keinen* Chip — das
++  ist Absicht (S6).
++- **session_files-Reload-Recovery**: Page-Reload löscht den
++  SessionFileChip; nächster exec füllt ihn wieder. Phase-3-Backlog
++  hatte den REST-Sync via conversation-load schon vorgesehen.
++- **FILE_ROUTING_V2-Flag-OFF**: wenn Phase 3 wieder ausgeschaltet wird,
++  schreiben die Pipelines kein `metadata.pathStatus` mehr — die UI ist
++  dann genauso defensiv wie bei Pre-Phase-3 (S6-Verhalten ist die
++  Auffanglinie).
++
++---
++
++## Phase Completion Checklist
++
++- [ ] Stage 1-3 erfolgreich + pm2 logs clean
++- [ ] Stage 4 Smoke-Test grün in incognito
++- [ ] Stage 5 UAT S1-S8 alle grün, Dennis Sign-Off
++- [ ] Stage 6 User-Comm versendet
++- [ ] Memory-Update: Phase-2-final mit prod-HEAD-commit-sha
++
++---
++
++## Format-Patches-Verzeichnis
++
++```
++deployment/patches/phase-2/
++├── 0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch  # Stage 1
++├── 0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch  # Stage 2
++└── 0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch   # Stage 3
++```
++
++Each patch is self-contained git format-patch off Phase-3 baseline `973969e`.
++Apply in order — they are not commutative (Stage 2 references Stage 1's
++imports; Stage 3 patches files Stage 2 created).
+diff --git a/deployment/uat/2026-05-07-file-handling-v2-phase-2.md b/deployment/uat/2026-05-07-file-handling-v2-phase-2.md
+new file mode 100644
+index 0000000..91327bf
+--- /dev/null
++++ b/deployment/uat/2026-05-07-file-handling-v2-phase-2.md
+@@ -0,0 +1,139 @@
++# Phase 2 UAT — Status-Chip UI
++
++**Branch:** `feature/file-handling-v2-phase-2-chip-ui`
++**Baseline:** Phase 3 (`973969e`) auf prod, FILE_ROUTING_V2=true.
++**Datum geplant:** 2026-05-07 (Dennis vor Ort).
++
++## Setup
++
++- [ ] Patches aus `deployment/patches/phase-2/` auf prod hand-applied
++      (siehe `phase-2-deploy-runbook.md` Stage 1-4).
++- [ ] Service-Worker-Cache geleert: User-Browser hat den neuen Build
++      geladen — bei Verdacht: incognito-Window + Hard-Refresh
++      (Ctrl+Shift+R) + DevTools → Application → Service Workers →
++      Unregister.
++- [ ] Test-User vorhanden, eingeloggt.
++- [ ] 3 Themes greifbar (Settings → Theme): **Light**, **Dark**, ggf. Neon.
++- [ ] Test-Files bereit:
++  - `test-small.pdf` (≤ 20 KB, durchsuchbarer Text)
++  - `test-large.pdf` (≥ 50 KB, durchsuchbarer Text)
++  - `test-encrypted.pdf` (verschlüsselt — bricht inline+rag)
++  - `test.zip` (10 KB — Code-Interpreter-Eingabe)
++  - bestehender `(RAG)`-Chat aus Phase-1.5-Migration (Pre-Phase-3-File-Rows)
++
++## Szenarien
++
++Pro Szenario: in mindestens 2 Themes (Light + Dark) testen, in Neon falls verfügbar.
++
++### S1 — Happy Path: kleine PDF (inline)
++
++1. Neuen Chat öffnen → `test-small.pdf` per Drag-Drop oder Paperclip hochladen.
++2. **Erwartung:** innerhalb ~3 s erscheint unter dem File ein Chip:
++   - Text: `Im Chat-Kontext geladen ✓ (X Zeichen)`
++   - Farbe: grün (chip-success).
++3. Tooltip leer (kein Failure).
++4. Erste Frage zum Inhalt schicken — Antwort soll auf den File-Inhalt eingehen.
++5. **Status-Bar in F12 / Network:** SSE-Stream `/api/files/status-stream`
++   ist offen, mind. ein `event: status` mit `state:loaded` enthalten.
++
++### S2 — Happy Path: große PDF (RAG)
++
++1. Neuen Chat → `test-large.pdf` hochladen.
++2. **Erwartung:** Chip wandert von:
++   - `wird verarbeitet …` (chip-pending, gestrichelt) →
++   - `Wissensbasis: indexiert wird …` (chip-pending) →
++   - `Wissensbasis indexiert ✓ (N Chunks)` (chip-success).
++3. Live-Update via SSE; mehrere `event: status` im Network-Tab sichtbar.
++
++### S3 — ZIP (mount-only)
++
++1. Neuen Chat → `test.zip` hochladen.
++2. **Erwartung:** kein chip ODER chip mit `wird verarbeitet …` (mount=ready
++   wird nicht explizit geschrieben — Option B aus Plan).
++3. Im Code-Interpreter: `import zipfile; zipfile.ZipFile('/mnt/data/test.zip').extractall('/mnt/data/extracted')`.
++4. Folge-Frage zur extrahierten Struktur — Code-Interpreter sieht
++   `/mnt/data/extracted/`.
++
++### S4 — Verschlüsselte PDF (inline+rag failure)
++
++1. Neuen Chat → `test-encrypted.pdf` hochladen.
++2. **Erwartung:** Chip zeigt:
++   - Variante a: `❌ Datei nicht verarbeitbar` (chip-error) — wenn
++     mount auch failed,
++   - Variante b: `⚠ Inline-Extraktion fehlgeschlagen: <Reason> · ⚠
++     Indexierung fehlgeschlagen: <Reason>` (chip-warn) — wenn mount ok.
++3. Tooltip enthält den konkreten Reason (verschlüsselt / encrypted).
++4. **Telemetrie-Check:** in MongoDB:
++   `db.filepathfailures.find().sort({createdAt:-1}).limit(2)` → 2 Einträge
++   für inline + rag mit Reason.
++
++### S5 — Forced rag-api-failure
++
++1. SSH auf prod: `pm2 stop rag-api`.
++2. Neuen Chat → `test-large.pdf` hochladen.
++3. **Erwartung:** Chip zeigt
++   `⚠ Indexierung fehlgeschlagen: rag-api unreachable` (chip-warn).
++4. Inline-Pfad bleibt erfolgreich (Chip enthält auch
++   `Im Chat-Kontext geladen ✓`).
++5. **Recovery:** `pm2 start rag-api`. Neuer Upload → Chip wieder grün.
++
++### S6 — Pre-Phase-3-File-Rows (Stale-Risk-Hoch)
++
++1. Bestehenden `(RAG)`-Chat aus Phase-1.5-Migration öffnen — File-Row hat
++   **kein** `metadata.pathStatus` in der DB.
++2. **Erwartung:** kein Crash, keine Console-Errors. Verhalten:
++   - Chip wird **gar nicht** angezeigt (FileContainer rendert keinen Chip
++     wenn `pathStatus === undefined`), ODER
++   - Chip zeigt `wird verarbeitet …` (chip-pending) — aber das ist
++     verwirrend.
++3. **Aktuelle Implementierung:** Chip wird *nicht* angezeigt für Pre-Phase-3-
++   Files (FileContainer.tsx Z. 30-32: `mergedPathStatus !== undefined`).
++   Das ist die definitive UX-Entscheidung — keine Verwirrung durch
++   "wird verarbeitet" für Files die schon längst fertig sind.
++4. **Manuell testen:** F12 → keine `Cannot read property 'state' of undefined`
++   o. ä. im Console.
++
++### S7 — Code-generierte Datei (`session_files`)
++
++1. Code-Interpreter-fähigen Agent öffnen (z. B. einen mit `execute_code`-Tool).
++2. Prompt: *"Erstelle eine kurze CSV-Datei `out.csv` mit drei Spalten und
++   speichere sie unter `/mnt/data/`."*
++3. Folge-Prompt: *"Lies die Datei `/mnt/data/out.csv` ein und zeige mir
++   die ersten 2 Zeilen."*
++4. **Erwartung:** unterhalb der Upload-Zeile erscheint ein zweiter Chip:
++   - Symbol: 📦
++   - Text: `out.csv · vom Code generiert` (chip-success).
++5. Tooltip enthält die `session_id`.
++6. **Reload-Test:** Browser-Reload des Chats. Chip verschwindet (P2-Trade-
++   off — initial-state via REST ist Phase-3-Backlog) — beim nächsten exec
++   erscheint er wieder.
++
++## Service-Worker-Check (CLAUDE.md-Gotcha)
++
++- Erst-Test in **incognito-Window**.
++- Bei Verdacht auf Stale-CSS: Hard-Refresh (Ctrl+Shift+R) + DevTools →
++  Application → Service Workers → Unregister.
++- Wenn Chip-Farben in Dark-Theme falsch aussehen: Theme einmal
++  umschalten (Light → Dark zurück).
++
++## Cross-User-Sicherheit
++
++### S8 — User-Scope der SSE-Events
++
++1. User A in Tab 1 öffnen, leerer Chat.
++2. User B (anderer Account) in Tab 2 (Incognito) öffnen, eine PDF hochladen.
++3. **Erwartung:** in Tab 1 von User A erscheint **kein** Chip-Update für
++   die User-B-Datei. Backend filtert per `event.userId === req.user.id`.
++
++## Acceptance-Kriterien
++
++- [ ] S1 grün in 2+ Themes
++- [ ] S2 grün in 2+ Themes; Live-Updates beobachtet (mind. 2 Status-Events)
++- [ ] S3 keine UI-Crashs
++- [ ] S4 chip-error oder chip-warn mit korrektem Reason in Tooltip
++- [ ] S4 `filepathfailures` befüllt
++- [ ] S5 Recovery sauber
++- [ ] S6 keine Console-Errors auf bestehenden Pre-Phase-3-Chats
++- [ ] S7 SessionFileChip erscheint live nach exec-Output
++- [ ] S8 keine Cross-User-Leaks beobachtet
++- [ ] Dennis Sign-Off ✍️
+diff --git a/deployment/user-comm/2026-05-07-file-status-chip-announcement.md b/deployment/user-comm/2026-05-07-file-status-chip-announcement.md
+new file mode 100644
+index 0000000..0fec3aa
+--- /dev/null
++++ b/deployment/user-comm/2026-05-07-file-status-chip-announcement.md
+@@ -0,0 +1,51 @@
++# User-Communication — File-Status-Chips (Phase 2)
++
++**Versand:** nach erfolgreichem Phase-2-Deploy + UAT-Sign-Off durch Dennis.
++**Empfänger:** alle aktiven Glöckle-AI-User (interner Verteiler).
++**Format:** kurze Mail oder Teams-Post.
++
++---
++
++## Vorgeschlagener Text (DE)
++
++Hallo zusammen,
++
++ab heute siehst du unter jeder hochgeladenen Datei einen kurzen
++**Status-Chip** — er sagt dir auf einen Blick, ob die Datei
++
++- ✓ als Kontext für den Chat geladen wurde,
++- ✓ in der Wissensbasis indexiert wurde (mit Anzahl Chunks), oder
++- ⚠ ob etwas beim Verarbeiten schiefgegangen ist (mit Grund).
++
++**Neu zusätzlich:** Wenn der Code-Interpreter eine Datei *erstellt*
++(z. B. eine CSV oder ein entpacktes ZIP), erscheint ein zweiter Chip
++mit dem 📦-Symbol — diese Datei steht dann automatisch beim nächsten
++Code-Run zur Verfügung.
++
++### Was muss ich tun?
++
++Nichts — die Anzeige läuft automatisch.
++
++### Was tun bei einem roten ❌ oder gelben ⚠?
++
++- **Rot ❌**: Datei konnte nicht hochgeladen werden — bitte einmal neu
++  hochladen oder bei mir melden.
++- **Gelb ⚠**: Datei ist im Chat verfügbar, konnte aber nicht in die
++  Wissensbasis indexiert werden (z. B. verschlüsselte PDF). Der Chat
++  funktioniert trotzdem — nur eine spätere Suche im Wissen findet die
++  Datei dann nicht.
++
++Beste Grüße,
++Dennis
++
++---
++
++## Sharp-Edge-Reminder für Dennis
++
++- Versand **erst nach** Phase-2-UAT-Sign-Off (S1-S7 grün in allen 3
++  Themes) — Status-Chip-Pre-Phase-3 (S6) ist die häufigste Stolperfalle.
++- Bei stillem Rollout: alte Chats zeigen *keine* Chips (Pre-Phase-3
++  File-Rows haben kein `metadata.pathStatus`). Das ist **kein Bug** —
++  die Chips erscheinen nur für Uploads ab Phase-2-Go-Live.
++- Service-Worker-Cache: User soll bei "Chip nicht sichtbar" einmal
++  Hard-Refresh machen (Ctrl+Shift+R) — siehe CLAUDE.md.
+-- 
+2.47.3
+

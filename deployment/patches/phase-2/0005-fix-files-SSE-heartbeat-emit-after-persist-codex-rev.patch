@@ -1,0 +1,453 @@
+From 2c35f3263d553d557f790caa64d0cf94fb5627df Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Thu, 7 May 2026 00:08:39 +0200
+Subject: [PATCH 5/9] fix(files): SSE heartbeat + emit-after-persist (codex
+ review F1+F3+F4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three backend findings from the Phase-2 codex pass:
+
+- F1 (statusStream): idle SSE connections used to send nothing between
+  events, so a 30–60s proxy timeout (nginx/cloudflare) would force-close
+  the connection. The bus has no replay, so any event during the
+  reconnect window is lost. Fix: 25s ': heartbeat' comments, cleared
+  in the same close/aborted path that drops bus listeners. Interval
+  unref()'d so it doesn't keep the event loop alive on its own.
+- F3 (inlinePipeline) / F4 (ragPipeline): safeEmit fired even when
+  the underlying updateFile() returned null (file row vanished —
+  TTL expired, user deleted) or rejected. The chip would then carry
+  state the DB doesn't reflect. Fix: safeUpdateFile returns the doc
+  on success, null otherwise; callers gate safeEmit on the truthy
+  result.
+
+Tests: 5 new heartbeat cases (emit, multi-emit, close-cleanup,
+aborted-cleanup, post-end no-write) + 4 new emit-gate cases
+(inline/rag × loaded-null/failed-throw). 19 existing pipeline tests
+unchanged.
+---
+ api/server/routes/files/statusStream.js       | 23 +++++-
+ api/server/routes/files/statusStream.spec.js  | 76 ++++++++++++++++++-
+ .../services/Files/__tests__/sse-bus.test.js  | 42 ++++++++++
+ api/server/services/Files/inlinePipeline.js   | 50 +++++++-----
+ api/server/services/Files/ragPipeline.js      | 62 ++++++++-------
+ 5 files changed, 202 insertions(+), 51 deletions(-)
+
+diff --git a/api/server/routes/files/statusStream.js b/api/server/routes/files/statusStream.js
+index 9e14061..9ef0b1c 100644
+--- a/api/server/routes/files/statusStream.js
++++ b/api/server/routes/files/statusStream.js
+@@ -1,6 +1,11 @@
+ const { logger } = require('@librechat/data-schemas');
+ const { statusBus } = require('~/server/services/Files/statusBus');
+ 
++// Most reverse-proxy/load-balancer setups close idle SSE responses after
++// 30–60s. We send a comment line every 25s to keep the response active —
++// shorter than the typical 30s nginx default, leaving headroom for jitter.
++const HEARTBEAT_INTERVAL_MS = 25_000;
++
+ /**
+  * Phase 2 — SSE handler for file-status updates.
+  *
+@@ -14,9 +19,15 @@ const { statusBus } = require('~/server/services/Files/statusBus');
+  *   - `event: session_file\ndata: { conversationId, userId, session_file:
+  *     { session_id, file_id, filename, generated_at }, timestamp }\n\n`
+  *
++ * Idle keepalive: emits `: heartbeat\n\n` every HEARTBEAT_INTERVAL_MS to keep
++ * the response unbuffered through long idle gaps (large OCR/RAG runs may
++ * exceed the proxy idle timeout). The bus has no replay, so a connection
++ * that gets force-closed by a proxy and reconnects can miss events emitted
++ * during the reconnect window — keep the connection alive instead.
++ *
+  * Listener cleanup happens on `req.on('close')` — required to avoid leaking
+  * listeners on the bus when clients disconnect (browser tab close,
+- * EventSource.close()).
++ * EventSource.close()). The heartbeat interval is cleared in the same path.
+  *
+  * Auth: relies on the parent router's `requireJwtAuth` middleware to populate
+  * `req.user`. Defensive 401 if missing — never trust the absence of middleware.
+@@ -63,7 +74,15 @@ function statusStreamHandler(req, res) {
+   statusBus.on('status', onStatus);
+   statusBus.on('session_file', onSessionFile);
+ 
++  const heartbeat = setInterval(() => {
++    safeWrite(res, ': heartbeat\n\n');
++  }, HEARTBEAT_INTERVAL_MS);
++  // Don't keep the Node event loop alive solely on this interval (e.g. during
++  // graceful shutdown) — let `req.close` drive cleanup as the source of truth.
++  if (typeof heartbeat.unref === 'function') heartbeat.unref();
++
+   const cleanup = () => {
++    clearInterval(heartbeat);
+     statusBus.off('status', onStatus);
+     statusBus.off('session_file', onSessionFile);
+   };
+@@ -81,4 +100,4 @@ function safeWrite(res, chunk) {
+   }
+ }
+ 
+-module.exports = { statusStreamHandler };
++module.exports = { statusStreamHandler, HEARTBEAT_INTERVAL_MS };
+diff --git a/api/server/routes/files/statusStream.spec.js b/api/server/routes/files/statusStream.spec.js
+index 3f48db7..9d6f584 100644
+--- a/api/server/routes/files/statusStream.spec.js
++++ b/api/server/routes/files/statusStream.spec.js
+@@ -2,7 +2,7 @@ jest.mock('@librechat/data-schemas', () => ({
+   logger: { warn: jest.fn(), debug: jest.fn(), info: jest.fn(), error: jest.fn() },
+ }));
+ 
+-const { statusStreamHandler } = require('./statusStream');
++const { statusStreamHandler, HEARTBEAT_INTERVAL_MS } = require('./statusStream');
+ const {
+   statusBus,
+   emitStatusUpdate,
+@@ -193,4 +193,78 @@ describe('GET /api/files/status-stream', () => {
+ 
+     expect(res.status).toHaveBeenCalledWith(401);
+   });
++
++  describe('heartbeat (codex F1 — idle SSE proxy timeout)', () => {
++    beforeEach(() => {
++      jest.useFakeTimers();
++    });
++    afterEach(() => {
++      jest.useRealTimers();
++    });
++
++    it('emits a keepalive comment after the heartbeat interval', () => {
++      const req = makeReq('u1');
++      const res = makeRes();
++      statusStreamHandler(req, res);
++      // Drop the initial `: connected ...` write so we can assert the
++      // heartbeat write in isolation.
++      res.writes.length = 0;
++
++      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS + 100);
++
++      expect(res.writes.join('')).toMatch(/^:\s*heartbeat\n\n/);
++    });
++
++    it('emits multiple heartbeats while the connection is open', () => {
++      const req = makeReq('u1');
++      const res = makeRes();
++      statusStreamHandler(req, res);
++      res.writes.length = 0;
++
++      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS * 3 + 200);
++
++      const heartbeatCount = res.writes.filter((w) => w.includes('heartbeat')).length;
++      expect(heartbeatCount).toBe(3);
++    });
++
++    it('clears the heartbeat interval on cleanup (no leak after disconnect)', () => {
++      const req = makeReq('u1');
++      const res = makeRes();
++      statusStreamHandler(req, res);
++
++      req._trigger('close');
++      res.writes.length = 0;
++
++      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS * 5);
++
++      expect(res.writes.length).toBe(0);
++    });
++
++    it('clears the heartbeat interval on req aborted as well', () => {
++      const req = makeReq('u1');
++      const res = makeRes();
++      statusStreamHandler(req, res);
++
++      req._trigger('aborted');
++      res.writes.length = 0;
++
++      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS * 2);
++
++      expect(res.writes.length).toBe(0);
++    });
++
++    it('stops writing heartbeats once the response has ended', () => {
++      const req = makeReq('u1');
++      const res = makeRes();
++      statusStreamHandler(req, res);
++      res.writableEnded = true;
++      res.writes.length = 0;
++
++      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS + 100);
++
++      // safeWrite is a no-op when writableEnded; the interval still ticks
++      // but produces no output.
++      expect(res.writes.length).toBe(0);
++    });
++  });
+ });
+diff --git a/api/server/services/Files/__tests__/sse-bus.test.js b/api/server/services/Files/__tests__/sse-bus.test.js
+index 3e9e11e..301f783 100644
+--- a/api/server/services/Files/__tests__/sse-bus.test.js
++++ b/api/server/services/Files/__tests__/sse-bus.test.js
+@@ -71,6 +71,7 @@ const { runRagPipeline } = require('../ragPipeline');
+ const { processCodeOutput } = require('../Code/process');
+ const { extractInlineText } = require('../inlineExtract');
+ const { embedToRag } = require('../VectorDB/embedToRag');
++const fileModelMock = require('~/models/File');
+ const { registerSessionFile } = require('~/models/Conversation');
+ 
+ describe('SSE bus emits from Phase-3 pipelines', () => {
+@@ -82,6 +83,9 @@ describe('SSE bus emits from Phase-3 pipelines', () => {
+     statusBus.on('status', (e) => emitted.status.push(e));
+     statusBus.on('session_file', (e) => emitted.session_file.push(e));
+     jest.clearAllMocks();
++    // Reset the default updateFile success-path between tests; the F3 / F4
++    // cases below override per-test with mockResolvedValueOnce / mockRejectedValueOnce.
++    fileModelMock.updateFile.mockResolvedValue({ file_id: 'persisted' });
+   });
+ 
+   describe('inlinePipeline', () => {
+@@ -126,6 +130,25 @@ describe('SSE bus emits from Phase-3 pipelines', () => {
+       await runInlinePipeline({ user: { id: 'u1' } }, largeFile, fileResult, 'conv-1');
+       expect(emitted.status).toHaveLength(0);
+     });
++
++    // Codex review F3 — emit must be gated on a persisted update.
++    it('does not emit on inline/loaded when updateFile returns null (file row vanished)', async () => {
++      extractInlineText.mockResolvedValue({ text: 'Hi', chars: 2, filename: 'x.pdf' });
++      fileModelMock.updateFile.mockResolvedValueOnce(null);
++
++      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
++
++      expect(emitted.status).toHaveLength(0);
++    });
++
++    it('does not emit on inline/failed when updateFile rejects (DB unreachable)', async () => {
++      extractInlineText.mockRejectedValue(new Error('PDF encrypted'));
++      fileModelMock.updateFile.mockRejectedValueOnce(new Error('Mongo down'));
++
++      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
++
++      expect(emitted.status).toHaveLength(0);
++    });
+   });
+ 
+   describe('ragPipeline', () => {
+@@ -174,6 +197,25 @@ describe('SSE bus emits from Phase-3 pipelines', () => {
+         reason: expect.stringMatching(/embedded=false/),
+       });
+     });
++
++    // Codex review F4 — emit must be gated on a persisted update.
++    it('does not emit on rag/embedded when updateFile returns null (file row vanished)', async () => {
++      embedToRag.mockResolvedValue({ embedded: true, chunks: 7 });
++      fileModelMock.updateFile.mockResolvedValueOnce(null);
++
++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
++
++      expect(emitted.status).toHaveLength(0);
++    });
++
++    it('does not emit on rag/failed when updateFile rejects (DB unreachable)', async () => {
++      embedToRag.mockRejectedValue(new Error('rag-api 502'));
++      fileModelMock.updateFile.mockRejectedValueOnce(new Error('Mongo down'));
++
++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
++
++      expect(emitted.status).toHaveLength(0);
++    });
+   });
+ 
+   describe('processCodeOutput', () => {
+diff --git a/api/server/services/Files/inlinePipeline.js b/api/server/services/Files/inlinePipeline.js
+index cd62b9d..713a8dc 100644
+--- a/api/server/services/Files/inlinePipeline.js
++++ b/api/server/services/Files/inlinePipeline.js
+@@ -47,21 +47,23 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
+   } catch (err) {
+     const reason = err && err.message ? err.message : String(err);
+     logger.warn(`[runInlinePipeline] extract failed for ${file_id}: ${reason}`);
+-    await safeUpdateFile({
++    const persisted = await safeUpdateFile({
+       file_id,
+       'metadata.pathStatus.inline.state': 'failed',
+       'metadata.pathStatus.inline.reason': reason,
+       'metadata.pathStatus.inline.completed_at': new Date(),
+     });
+-    safeEmit({
+-      file_id,
+-      filename,
+-      conversationId,
+-      userId: req && req.user && req.user.id,
+-      path: 'inline',
+-      state: 'failed',
+-      reason,
+-    });
++    if (persisted) {
++      safeEmit({
++        file_id,
++        filename,
++        conversationId,
++        userId: req && req.user && req.user.id,
++        path: 'inline',
++        state: 'failed',
++        reason,
++      });
++    }
+     if (conversationId) {
+       try {
+         const { recordFilePathFailure } = require('~/models/FilePathFailure');
+@@ -82,22 +84,24 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
+     return;
+   }
+ 
+-  await safeUpdateFile({
++  const persisted = await safeUpdateFile({
+     file_id,
+     'metadata.extracted_text': extracted.text,
+     'metadata.pathStatus.inline.state': 'loaded',
+     'metadata.pathStatus.inline.chars': extracted.chars,
+     'metadata.pathStatus.inline.completed_at': new Date(),
+   });
+-  safeEmit({
+-    file_id,
+-    filename,
+-    conversationId,
+-    userId: req && req.user && req.user.id,
+-    path: 'inline',
+-    state: 'loaded',
+-    chars: extracted.chars,
+-  });
++  if (persisted) {
++    safeEmit({
++      file_id,
++      filename,
++      conversationId,
++      userId: req && req.user && req.user.id,
++      path: 'inline',
++      state: 'loaded',
++      chars: extracted.chars,
++    });
++  }
+ }
+ 
+ function safeEmit(event) {
+@@ -108,14 +112,18 @@ function safeEmit(event) {
+   }
+ }
+ 
++// Returns the updated File doc on success, or null when the row does not
++// exist or the write failed. Callers gate `safeEmit` on the truthy result so
++// we never broadcast a state change the DB doesn't reflect (Codex review F3).
+ async function safeUpdateFile(data) {
+   try {
+     const { updateFile } = require('~/models/File');
+-    await updateFile(data);
++    return (await updateFile(data)) || null;
+   } catch (err) {
+     logger.warn(
+       `[runInlinePipeline] updateFile failed for ${data.file_id}: ${err && err.message}`,
+     );
++    return null;
+   }
+ }
+ 
+diff --git a/api/server/services/Files/ragPipeline.js b/api/server/services/Files/ragPipeline.js
+index f24849f..392122e 100644
+--- a/api/server/services/Files/ragPipeline.js
++++ b/api/server/services/Files/ragPipeline.js
+@@ -43,21 +43,23 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id)
+   } catch (err) {
+     const reason = err && err.message ? err.message : String(err);
+     logger.warn(`[runRagPipeline] embed failed for ${file_id}: ${reason}`);
+-    await safeUpdateFile({
++    const persisted = await safeUpdateFile({
+       file_id,
+       'metadata.pathStatus.rag.state': 'failed',
+       'metadata.pathStatus.rag.reason': reason,
+       'metadata.pathStatus.rag.completed_at': new Date(),
+     });
+-    safeEmit({
+-      file_id,
+-      filename: fileResult.filename,
+-      conversationId,
+-      userId: req && req.user && req.user.id,
+-      path: 'rag',
+-      state: 'failed',
+-      reason,
+-    });
++    if (persisted) {
++      safeEmit({
++        file_id,
++        filename: fileResult.filename,
++        conversationId,
++        userId: req && req.user && req.user.id,
++        path: 'rag',
++        state: 'failed',
++        reason,
++      });
++    }
+     if (conversationId) {
+       try {
+         const { recordFilePathFailure } = require('~/models/FilePathFailure');
+@@ -91,23 +93,25 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id)
+     update['metadata.pathStatus.rag.reason'] =
+       'rag-api returned embedded=false (unsupported MIME or known_type=false)';
+   }
+-  await safeUpdateFile(update);
++  const persisted = await safeUpdateFile(update);
+ 
+-  const emitState = result && result.embedded ? 'embedded' : 'failed';
+-  safeEmit({
+-    file_id,
+-    filename: fileResult.filename,
+-    conversationId,
+-    userId: req && req.user && req.user.id,
+-    path: 'rag',
+-    state: emitState,
+-    ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
+-    ...(emitState === 'failed'
+-      ? {
+-          reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
+-        }
+-      : {}),
+-  });
++  if (persisted) {
++    const emitState = result && result.embedded ? 'embedded' : 'failed';
++    safeEmit({
++      file_id,
++      filename: fileResult.filename,
++      conversationId,
++      userId: req && req.user && req.user.id,
++      path: 'rag',
++      state: emitState,
++      ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
++      ...(emitState === 'failed'
++        ? {
++            reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
++          }
++        : {}),
++    });
++  }
+ }
+ 
+ function safeEmit(event) {
+@@ -118,14 +122,18 @@ function safeEmit(event) {
+   }
+ }
+ 
++// Returns the updated File doc on success, or null when the row does not
++// exist or the write failed. Callers gate `safeEmit` on the truthy result so
++// we never broadcast a state change the DB doesn't reflect (Codex review F4).
+ async function safeUpdateFile(data) {
+   try {
+     const { updateFile } = require('~/models/File');
+-    await updateFile(data);
++    return (await updateFile(data)) || null;
+   } catch (err) {
+     logger.warn(
+       `[runRagPipeline] updateFile failed for ${data.file_id}: ${err && err.message}`,
+     );
++    return null;
+   }
+ }
+ 
+-- 
+2.47.3
+

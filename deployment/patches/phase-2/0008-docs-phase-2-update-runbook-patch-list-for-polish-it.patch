@@ -1,0 +1,80 @@
+From a3efb5bb313477739b7d2515aa3a14a0f1c7efed Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Thu, 7 May 2026 00:14:02 +0200
+Subject: [PATCH 8/9] docs(phase-2): update runbook patch-list for
+ polish-iter-1
+
+Apply / reverse loops are now data-driven (for-loop over numbered patch
+range) so adding more patches doesn't require touching the runbook
+again. The format-patch index lists 0001-0007 with stage / polish-iter
+attribution.
+---
+ deployment/phase-2-deploy-runbook.md | 31 ++++++++++++++--------------
+ 1 file changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/deployment/phase-2-deploy-runbook.md b/deployment/phase-2-deploy-runbook.md
+index e2224b7..0211639 100644
+--- a/deployment/phase-2-deploy-runbook.md
++++ b/deployment/phase-2-deploy-runbook.md
+@@ -34,7 +34,8 @@ liegen unter `deployment/patches/phase-2/`. Phase 2 ist komplett
+ # WSL host:
+ cd /home/elsner/LibreChat-fork-phase-2
+ ls deployment/patches/phase-2/
+-# 3 Patches: 0001 (SSE-Bus + Route), 0002 (Chips + Hook), 0003 (Pipelines + CSS)
++# Stages 1-3 als 0001-0003, Stage 4 (docs) als 0004, Codex-polish als 0005-0007.
++# Apply in order — siehe "Format-Patches-Verzeichnis" unten.
+ 
+ scp deployment/patches/phase-2/*.patch slx-ki-webapp.gloeckle.local:/tmp/
+ ```
+@@ -50,14 +51,10 @@ git status -s    # snapshot der bestehenden customizations
+ git stash --include-untracked --message "phase-2-deploy-stash"
+ 
+ # 3-way merge — fängt Konflikte ab statt blind zu überschreiben.
+-git apply --3way --check /tmp/0001-*.patch
+-git apply --3way        /tmp/0001-*.patch
+-
+-git apply --3way --check /tmp/0002-*.patch
+-git apply --3way        /tmp/0002-*.patch
+-
+-git apply --3way --check /tmp/0003-*.patch
+-git apply --3way        /tmp/0003-*.patch
++for p in /tmp/000{1,2,3,4,5,6,7}-*.patch; do
++  git apply --3way --check "$p"
++  git apply --3way        "$p"
++done
+ ```
+ 
+ **Wahrscheinliche Konfliktstellen** (Phase-3-deploy hat das genauso
+@@ -160,9 +157,9 @@ npm run frontend
+ ### Option B — Voll-Rollback (alle 3 Patches)
+ 
+ ```bash
+-git apply --reverse /tmp/0003-*.patch
+-git apply --reverse /tmp/0002-*.patch
+-git apply --reverse /tmp/0001-*.patch
++for p in /tmp/000{7,6,5,4,3,2,1}-*.patch; do
++  git apply --reverse "$p"
++done
+ npm run build:packages
+ npm run frontend
+ pm2 restart librechat-api
+@@ -212,9 +209,13 @@ phase-2-deploy-stash.
+ 
+ ```
+ deployment/patches/phase-2/
+-├── 0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch  # Stage 1
+-├── 0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch  # Stage 2
+-└── 0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch   # Stage 3
++├── 0001-feat-files-SSE-bus-status-stream-route-for-Phase-2-c.patch  # Stage 1: SSE bus + route
++├── 0002-feat-files-FileStatusChip-SessionFileChip-SSE-hook-f.patch  # Stage 2: chips + hook + integration
++├── 0003-feat-files-pipeline-emit-hooks-chip-CSS-for-Phase-2.patch   # Stage 3: pipeline emits + CSS
++├── 0004-docs-phase-2-UAT-playbook-deploy-runbook-format-patc.patch  # Stage 4: docs (will be partly self-modifying — that's expected)
++├── 0005-fix-files-SSE-heartbeat-emit-after-persist-codex-rev.patch  # Polish-iter-1: F1 + F3 + F4
++├── 0006-fix-files-reset-hook-state-on-convo-change-activate-.patch  # Polish-iter-1: F2 + F5
++└── 0007-docs-phase-2-correct-stash-pop-ref-in-deploy-runbook.patch  # Polish-iter-1: F6
+ ```
+ 
+ Each patch is self-contained git format-patch off Phase-3 baseline `973969e`.
+-- 
+2.47.3
+

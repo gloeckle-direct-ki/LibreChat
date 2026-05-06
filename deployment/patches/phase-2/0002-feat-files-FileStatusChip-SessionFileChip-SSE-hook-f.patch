@@ -1,7 +1,7 @@
 From f6967dc16c3c15d61d48717b9ae1184679101959 Mon Sep 17 00:00:00 2001
 From: pucawo <github@pucawo.de>
 Date: Wed, 6 May 2026 23:39:53 +0200
-Subject: [PATCH 2/3] feat(files): FileStatusChip + SessionFileChip + SSE hook
+Subject: [PATCH 2/9] feat(files): FileStatusChip + SessionFileChip + SSE hook
  for chip-UI
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
