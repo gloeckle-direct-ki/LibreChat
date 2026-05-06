@@ -82,7 +82,13 @@ echo "[OK] all patches applied"
 # Nur erreicht wenn alle Patches sauber durch sind — set -e hat oben sonst
 # abgebrochen. Stash-Pop kann immer noch auf prod-customizations konfligen;
 # der trap-Handler oben gibt im Fall die Recovery-Schritte aus.
-STASH_REF=$(git stash list | grep phase-2-deploy-stash | head -1 | cut -d: -f1)
+#
+# `|| true` damit set -e nicht triggert wenn grep nichts findet (= keine
+# Stash existierte, z.B. weil git status -s ohne uncommitted changes
+# returnte und der vorige `git stash` ein no-op war). `grep -m1` statt
+# `head -1` vermeidet einen SIGPIPE der unter pipefail ebenfalls den trap
+# auslösen würde.
+STASH_REF=$(git stash list | grep -m1 phase-2-deploy-stash | cut -d: -f1 || true)
 if [ -n "$STASH_REF" ]; then
   echo "[stash-pop] $STASH_REF"
   git stash pop "$STASH_REF"
