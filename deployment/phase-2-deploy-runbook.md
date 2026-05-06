@@ -74,8 +74,16 @@ gesehen):
 4. `api/server/routes/files/index.js` — append-only, sauber.
 
 ```bash
-# Nach erfolgreichem Apply:
-git stash pop "phase-2-deploy-stash"   # bestehende customizations zurück
+# Nach erfolgreichem Apply: Stash wieder zurückholen.
+# WICHTIG: `git stash pop "phase-2-deploy-stash"` ist KEIN gültiger Stash-Ref —
+# git stash erwartet stash@{N}. Über die Message muss erst der Index gefunden
+# werden, oder direkt `stash@{0}` wenn nichts dazwischen gestashed wurde.
+STASH_REF=$(git stash list | grep "phase-2-deploy-stash" | head -1 | cut -d: -f1)
+if [ -n "$STASH_REF" ]; then
+  git stash pop "$STASH_REF"
+else
+  echo "phase-2-deploy-stash nicht gefunden — git stash list manuell prüfen."
+fi
 # → ggf. nochmal mergen falls Konflikte
 ```
 
