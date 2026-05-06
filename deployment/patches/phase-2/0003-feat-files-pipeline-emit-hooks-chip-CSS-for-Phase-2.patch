@@ -1,0 +1,499 @@
+From bf9ad824699607176f775e1549b866324f047614 Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Wed, 6 May 2026 23:45:01 +0200
+Subject: [PATCH 3/3] feat(files): pipeline emit-hooks + chip CSS for Phase 2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stage 3 of Phase 2:
+
+- inlinePipeline / ragPipeline: emit a 'status' event next to every
+  pathStatus write (loaded / failed / embedded / failed). Minimal-
+  invasive next to the existing safeUpdateFile call rather than a
+  refactor — keeps the Phase 3 write semantics intact.
+- processCodeOutput: emit 'session_file' after registerSessionFile
+  *successfully matches* a conversation. Matched=0 (cross-user
+  injection silently rejected) and DB throws both skip the emit so
+  the bus never carries something the DB doesn't reflect.
+- style.css: .file-status-chip + .chip-success/.chip-warn/.chip-error/
+  .chip-pending using LibreChat's --green/--amber/--red ramp + .dark
+  overrides. Same vars Light/Dark/Neon all consume, so the chip
+  inherits the theme cleanly.
+
+Tests: sse-bus.test.js — 9 cases covering happy, failure, skip-route
+and cross-user-injection paths.
+
+Phase 2 Tasks 6 + 7.
+---
+ api/server/services/Files/Code/process.js     |  18 +-
+ .../services/Files/__tests__/sse-bus.test.js  | 236 ++++++++++++++++++
+ api/server/services/Files/inlinePipeline.js   |  27 ++
+ api/server/services/Files/ragPipeline.js      |  34 +++
+ client/src/style.css                          |  59 +++++
+ 5 files changed, 373 insertions(+), 1 deletion(-)
+ create mode 100644 api/server/services/Files/__tests__/sse-bus.test.js
+
+diff --git a/api/server/services/Files/Code/process.js b/api/server/services/Files/Code/process.js
+index 34aa89a..9960afc 100644
+--- a/api/server/services/Files/Code/process.js
++++ b/api/server/services/Files/Code/process.js
+@@ -17,6 +17,7 @@ const { convertImage } = require('~/server/services/Files/images/convert');
+ const { createFile, getFiles, updateFile } = require('~/models');
+ const { Conversation } = require('~/db/models');
+ const { registerSessionFile } = require('~/models/Conversation');
++const { emitSessionFileUpdate } = require('~/server/services/Files/statusBus');
+ 
+ /**
+  * Process OpenAI image files, convert to target format, save and return file metadata.
+@@ -49,11 +50,26 @@ const processCodeOutput = async ({
+   const userId = req?.user?.id;
+   if (conversationId && session_id && id && name && userId) {
+     try {
+-      await registerSessionFile(conversationId, userId, {
++      const result = await registerSessionFile(conversationId, userId, {
+         session_id,
+         file_id: id,
+         filename: name,
+       });
++      // Phase 2 — only emit when the write actually landed (matched a convo).
++      // Skips no-op cross-user-injection cases that registerSessionFile
++      // silently rejects (matchedCount === 0).
++      if (result && result.matchedCount > 0) {
++        try {
++          emitSessionFileUpdate({
++            conversationId,
++            userId,
++            session_file: { session_id, file_id: id, filename: name },
++            timestamp: new Date().toISOString(),
++          });
++        } catch (emitErr) {
++          logger.warn(`[processCodeOutput] emitSessionFileUpdate failed: ${emitErr.message}`);
++        }
++      }
+     } catch (err) {
+       logger.warn(`[processCodeOutput] registerSessionFile failed: ${err.message}`);
+     }
+diff --git a/api/server/services/Files/__tests__/sse-bus.test.js b/api/server/services/Files/__tests__/sse-bus.test.js
+new file mode 100644
+index 0000000..3e9e11e
+--- /dev/null
++++ b/api/server/services/Files/__tests__/sse-bus.test.js
+@@ -0,0 +1,236 @@
++/**
++ * Phase 2 Task 7 — verifies that the existing pipelines emit SSE events
++ * next to their pathStatus / session_files writes.
++ *
++ * Mocks the underlying I/O (extractInlineText, embedToRag, updateFile,
++ * registerSessionFile) and only asserts on bus listeners — the writes
++ * themselves are exercised by pipeline-specific tests already.
++ */
++
++jest.mock('../inlineExtract', () => ({
++  extractInlineText: jest.fn(),
++}));
++
++jest.mock('../VectorDB/embedToRag', () => ({
++  embedToRag: jest.fn(),
++}));
++
++jest.mock('~/models/File', () => ({
++  updateFile: jest.fn().mockResolvedValue({}),
++}));
++
++jest.mock('~/models/FilePathFailure', () => ({
++  recordFilePathFailure: jest.fn().mockResolvedValue(),
++}));
++
++jest.mock('~/models/Conversation', () => ({
++  registerSessionFile: jest.fn(),
++}));
++
++// Code/process.js pulls a *lot* of dependencies; mock the heavy ones so the
++// require() doesn't drag in axios/agents/strategies/permissions trees.
++jest.mock('@librechat/agents', () => ({
++  getCodeBaseURL: () => 'http://code.local',
++}));
++
++jest.mock('@librechat/api', () => ({
++  logAxiosError: jest.fn(),
++  getBasePath: () => '',
++}));
++
++jest.mock('axios', () => ({
++  get: jest.fn(),
++  post: jest.fn(),
++}));
++
++jest.mock('~/server/services/Files/permissions', () => ({
++  filterFilesByAgentAccess: jest.fn(),
++}));
++
++jest.mock('~/server/services/Files/strategies', () => ({
++  getStrategyFunctions: jest.fn(() => ({})),
++}));
++
++jest.mock('~/server/services/Files/images/convert', () => ({
++  convertImage: jest.fn(),
++}));
++
++jest.mock('~/models', () => ({
++  createFile: jest.fn(),
++  getFiles: jest.fn(),
++  updateFile: jest.fn(),
++}));
++
++jest.mock('~/db/models', () => ({
++  Conversation: {},
++}));
++
++const { statusBus } = require('../statusBus');
++const { runInlinePipeline } = require('../inlinePipeline');
++const { runRagPipeline } = require('../ragPipeline');
++const { processCodeOutput } = require('../Code/process');
++const { extractInlineText } = require('../inlineExtract');
++const { embedToRag } = require('../VectorDB/embedToRag');
++const { registerSessionFile } = require('~/models/Conversation');
++
++describe('SSE bus emits from Phase-3 pipelines', () => {
++  let emitted;
++
++  beforeEach(() => {
++    emitted = { status: [], session_file: [] };
++    statusBus.removeAllListeners();
++    statusBus.on('status', (e) => emitted.status.push(e));
++    statusBus.on('session_file', (e) => emitted.session_file.push(e));
++    jest.clearAllMocks();
++  });
++
++  describe('inlinePipeline', () => {
++    const file = { path: '/tmp/x.pdf', mimetype: 'application/pdf', size: 5_000 };
++    const fileResult = { file_id: 'f-1', filename: 'x.pdf' };
++
++    it('emits status: inline/loaded with chars on success', async () => {
++      extractInlineText.mockResolvedValue({ text: 'Hi', chars: 2, filename: 'x.pdf' });
++
++      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
++
++      expect(emitted.status).toHaveLength(1);
++      expect(emitted.status[0]).toMatchObject({
++        file_id: 'f-1',
++        filename: 'x.pdf',
++        conversationId: 'conv-1',
++        userId: 'u1',
++        path: 'inline',
++        state: 'loaded',
++        chars: 2,
++      });
++      expect(emitted.status[0].timestamp).toMatch(/^\d{4}-/);
++    });
++
++    it('emits status: inline/failed with reason on extract-failure', async () => {
++      extractInlineText.mockRejectedValue(new Error('PDF encrypted'));
++
++      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
++
++      expect(emitted.status).toHaveLength(1);
++      expect(emitted.status[0]).toMatchObject({
++        file_id: 'f-1',
++        path: 'inline',
++        state: 'failed',
++        reason: 'PDF encrypted',
++        userId: 'u1',
++      });
++    });
++
++    it('does not emit when route decision skips inline (size > threshold)', async () => {
++      const largeFile = { ...file, size: 100_000 };
++      await runInlinePipeline({ user: { id: 'u1' } }, largeFile, fileResult, 'conv-1');
++      expect(emitted.status).toHaveLength(0);
++    });
++  });
++
++  describe('ragPipeline', () => {
++    const file = { path: '/tmp/big.pdf', mimetype: 'application/pdf', size: 50_000 };
++    const fileResult = { file_id: 'f-2', filename: 'big.pdf' };
++
++    it('emits status: rag/embedded with chunks on success', async () => {
++      embedToRag.mockResolvedValue({ embedded: true, chunks: 7 });
++
++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
++
++      expect(emitted.status).toHaveLength(1);
++      expect(emitted.status[0]).toMatchObject({
++        file_id: 'f-2',
++        path: 'rag',
++        state: 'embedded',
++        chunks: 7,
++        userId: 'u2',
++      });
++    });
++
++    it('emits status: rag/failed with reason on embed-failure', async () => {
++      embedToRag.mockRejectedValue(new Error('rag-api 502'));
++
++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
++
++      expect(emitted.status).toHaveLength(1);
++      expect(emitted.status[0]).toMatchObject({
++        file_id: 'f-2',
++        path: 'rag',
++        state: 'failed',
++        reason: 'rag-api 502',
++      });
++    });
++
++    it('emits status: rag/failed when rag-api returns embedded=false', async () => {
++      embedToRag.mockResolvedValue({ embedded: false });
++
++      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
++
++      expect(emitted.status).toHaveLength(1);
++      expect(emitted.status[0]).toMatchObject({
++        file_id: 'f-2',
++        path: 'rag',
++        state: 'failed',
++        reason: expect.stringMatching(/embedded=false/),
++      });
++    });
++  });
++
++  describe('processCodeOutput', () => {
++    it('emits session_file when registerSessionFile succeeds', async () => {
++      registerSessionFile.mockResolvedValue({ matchedCount: 1, modifiedCount: 1 });
++
++      await processCodeOutput({
++        req: { user: { id: 'u3' } },
++        id: 'sf-1',
++        name: 'out.csv',
++        apiKey: 'k',
++        toolCallId: 't',
++        conversationId: 'conv-3',
++        messageId: 'm',
++        session_id: 'sess-A',
++      });
++
++      expect(emitted.session_file).toHaveLength(1);
++      expect(emitted.session_file[0]).toMatchObject({
++        conversationId: 'conv-3',
++        userId: 'u3',
++        session_file: { session_id: 'sess-A', file_id: 'sf-1', filename: 'out.csv' },
++      });
++    });
++
++    it('does not emit session_file when matchedCount=0 (cross-user injection rejected)', async () => {
++      registerSessionFile.mockResolvedValue({ matchedCount: 0, modifiedCount: 0 });
++
++      await processCodeOutput({
++        req: { user: { id: 'attacker' } },
++        id: 'malicious',
++        name: 'bad.csv',
++        apiKey: 'k',
++        toolCallId: 't',
++        conversationId: 'victim-conv',
++        messageId: 'm',
++        session_id: 'sess-X',
++      });
++
++      expect(emitted.session_file).toHaveLength(0);
++    });
++
++    it('does not emit session_file when registerSessionFile throws', async () => {
++      registerSessionFile.mockRejectedValue(new Error('DB down'));
++
++      await processCodeOutput({
++        req: { user: { id: 'u3' } },
++        id: 'sf-2',
++        name: 'out.csv',
++        apiKey: 'k',
++        toolCallId: 't',
++        conversationId: 'conv-3',
++        messageId: 'm',
++        session_id: 'sess-A',
++      });
++
++      expect(emitted.session_file).toHaveLength(0);
++    });
++  });
++});
+diff --git a/api/server/services/Files/inlinePipeline.js b/api/server/services/Files/inlinePipeline.js
+index 62a3ae3..cd62b9d 100644
+--- a/api/server/services/Files/inlinePipeline.js
++++ b/api/server/services/Files/inlinePipeline.js
+@@ -1,6 +1,7 @@
+ const { logger } = require('@librechat/data-schemas');
+ const { routeFile } = require('./routing');
+ const { extractInlineText } = require('./inlineExtract');
++const { emitStatusUpdate } = require('./statusBus');
+ 
+ /**
+  * Phase 3 Task 3 — runs the inline pipeline for one freshly uploaded file.
+@@ -52,6 +53,15 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
+       'metadata.pathStatus.inline.reason': reason,
+       'metadata.pathStatus.inline.completed_at': new Date(),
+     });
++    safeEmit({
++      file_id,
++      filename,
++      conversationId,
++      userId: req && req.user && req.user.id,
++      path: 'inline',
++      state: 'failed',
++      reason,
++    });
+     if (conversationId) {
+       try {
+         const { recordFilePathFailure } = require('~/models/FilePathFailure');
+@@ -79,6 +89,23 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
+     'metadata.pathStatus.inline.chars': extracted.chars,
+     'metadata.pathStatus.inline.completed_at': new Date(),
+   });
++  safeEmit({
++    file_id,
++    filename,
++    conversationId,
++    userId: req && req.user && req.user.id,
++    path: 'inline',
++    state: 'loaded',
++    chars: extracted.chars,
++  });
++}
++
++function safeEmit(event) {
++  try {
++    emitStatusUpdate({ ...event, timestamp: new Date().toISOString() });
++  } catch (err) {
++    logger.warn(`[runInlinePipeline] emit failed: ${err && err.message}`);
++  }
+ }
+ 
+ async function safeUpdateFile(data) {
+diff --git a/api/server/services/Files/ragPipeline.js b/api/server/services/Files/ragPipeline.js
+index a28c0ce..f24849f 100644
+--- a/api/server/services/Files/ragPipeline.js
++++ b/api/server/services/Files/ragPipeline.js
+@@ -1,6 +1,7 @@
+ const { logger } = require('@librechat/data-schemas');
+ const { routeFile } = require('./routing');
+ const { embedToRag } = require('./VectorDB/embedToRag');
++const { emitStatusUpdate } = require('./statusBus');
+ 
+ /**
+  * Phase 3 Task 4 — runs the RAG pipeline for one freshly uploaded file.
+@@ -48,6 +49,15 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id)
+       'metadata.pathStatus.rag.reason': reason,
+       'metadata.pathStatus.rag.completed_at': new Date(),
+     });
++    safeEmit({
++      file_id,
++      filename: fileResult.filename,
++      conversationId,
++      userId: req && req.user && req.user.id,
++      path: 'rag',
++      state: 'failed',
++      reason,
++    });
+     if (conversationId) {
+       try {
+         const { recordFilePathFailure } = require('~/models/FilePathFailure');
+@@ -82,6 +92,30 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id)
+       'rag-api returned embedded=false (unsupported MIME or known_type=false)';
+   }
+   await safeUpdateFile(update);
++
++  const emitState = result && result.embedded ? 'embedded' : 'failed';
++  safeEmit({
++    file_id,
++    filename: fileResult.filename,
++    conversationId,
++    userId: req && req.user && req.user.id,
++    path: 'rag',
++    state: emitState,
++    ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
++    ...(emitState === 'failed'
++      ? {
++          reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
++        }
++      : {}),
++  });
++}
++
++function safeEmit(event) {
++  try {
++    emitStatusUpdate({ ...event, timestamp: new Date().toISOString() });
++  } catch (err) {
++    logger.warn(`[runRagPipeline] emit failed: ${err && err.message}`);
++  }
+ }
+ 
+ async function safeUpdateFile(data) {
+diff --git a/client/src/style.css b/client/src/style.css
+index 689c054..2872b3e 100644
+--- a/client/src/style.css
++++ b/client/src/style.css
+@@ -2922,3 +2922,62 @@ html {
+ .sharepoint-picker-bg {
+   background-color: #f5f5f5;
+ }
++
++/* Phase 2 — file-status chip below uploaded / generated files. */
++.file-status-chip {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  padding: 2px 8px;
++  border-radius: 12px;
++  font-size: 0.75rem;
++  line-height: 1.25;
++  background-color: var(--surface-secondary);
++  color: var(--text-secondary);
++  border: 1px solid var(--border-light);
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  max-width: 100%;
++}
++
++.file-status-chip.chip-success {
++  color: var(--green-700);
++  border-color: var(--green-300);
++  background-color: var(--green-50);
++}
++
++.dark .file-status-chip.chip-success {
++  color: var(--green-300);
++  border-color: var(--green-700);
++  background-color: rgba(16, 185, 129, 0.08);
++}
++
++.file-status-chip.chip-warn {
++  color: var(--amber-600);
++  border-color: var(--amber-300);
++  background-color: var(--amber-50);
++}
++
++.dark .file-status-chip.chip-warn {
++  color: var(--amber-300);
++  border-color: var(--amber-700);
++  background-color: rgba(245, 158, 11, 0.08);
++}
++
++.file-status-chip.chip-error {
++  color: var(--red-700);
++  border-color: var(--red-300);
++  background-color: var(--red-50);
++}
++
++.dark .file-status-chip.chip-error {
++  color: var(--red-300);
++  border-color: var(--red-700);
++  background-color: rgba(239, 68, 68, 0.08);
++}
++
++.file-status-chip.chip-pending {
++  color: var(--text-tertiary);
++  border-style: dashed;
++}
+-- 
+2.47.3
+

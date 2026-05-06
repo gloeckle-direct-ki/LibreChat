@@ -1,0 +1,664 @@
+From 490e69599518b7487a6c738a859693b23b94bbb2 Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Wed, 6 May 2026 23:27:30 +0200
+Subject: [PATCH 1/3] feat(files): SSE bus + status-stream route for Phase 2
+ chip-UI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the backend foundation for live file-status visibility:
+
+- statusBus.js: in-process EventEmitter with two channels (status,
+  session_file). Sized for ~100 concurrent SSE clients.
+- updatePathStatus(file_id, path, payload): wrapper around File.updateOne
+  that writes metadata.pathStatus.<path>.{state, reason?, chars?, chunks?,
+  completed_at} and emits to the bus. Best-effort; failures are logged but
+  never thrown — the upload path must not break on emit failure.
+- GET /api/files/status-stream: SSE handler scoped per-user via
+  event.userId, with optional ?conversationId= filter. Cleans up
+  listeners on req close/aborted to avoid leak. Defensive 401 if
+  req.user is absent.
+
+Tests: 13 unit tests across statusBus, updatePathStatus (mongo-memory),
+and statusStream (mock req/res). Cross-user-leak guard verified.
+
+Phase 2 Task 2 + 3.
+---
+ api/server/routes/files/index.js              |   5 +
+ api/server/routes/files/statusStream.js       |  84 ++++++++
+ api/server/routes/files/statusStream.spec.js  | 196 ++++++++++++++++++
+ api/server/services/Files/statusBus.js        |  32 +++
+ api/server/services/Files/statusBus.spec.js   |  53 +++++
+ api/server/services/Files/updatePathStatus.js |  70 +++++++
+ .../services/Files/updatePathStatus.spec.js   | 125 +++++++++++
+ 7 files changed, 565 insertions(+)
+ create mode 100644 api/server/routes/files/statusStream.js
+ create mode 100644 api/server/routes/files/statusStream.spec.js
+ create mode 100644 api/server/services/Files/statusBus.js
+ create mode 100644 api/server/services/Files/statusBus.spec.js
+ create mode 100644 api/server/services/Files/updatePathStatus.js
+ create mode 100644 api/server/services/Files/updatePathStatus.spec.js
+
+diff --git a/api/server/routes/files/index.js b/api/server/routes/files/index.js
+index 5d32b91..803ee8c 100644
+--- a/api/server/routes/files/index.js
++++ b/api/server/routes/files/index.js
+@@ -14,6 +14,7 @@ const files = require('./files');
+ const images = require('./images');
+ const avatar = require('./avatar');
+ const speech = require('./speech');
++const { statusStreamHandler } = require('./statusStream');
+ 
+ const initialize = async () => {
+   const router = express.Router();
+@@ -28,6 +29,10 @@ const initialize = async () => {
+   /* Important: speech route must be added before the upload limiters */
+   router.use('/speech', speech);
+ 
++  /* Phase 2 — SSE channel for live file-status / session_file updates.
++     Long-lived GET; sits before the POST-only upload rate-limiters. */
++  router.get('/status-stream', statusStreamHandler);
++
+   const { fileUploadIpLimiter, fileUploadUserLimiter } = createFileLimiters();
+ 
+   /** Apply rate limiters to all POST routes (excluding /speech which is handled above) */
+diff --git a/api/server/routes/files/statusStream.js b/api/server/routes/files/statusStream.js
+new file mode 100644
+index 0000000..9e14061
+--- /dev/null
++++ b/api/server/routes/files/statusStream.js
+@@ -0,0 +1,84 @@
++const { logger } = require('@librechat/data-schemas');
++const { statusBus } = require('~/server/services/Files/statusBus');
++
++/**
++ * Phase 2 — SSE handler for file-status updates.
++ *
++ * Subscribes to the in-process statusBus and forwards events to the client
++ * as Server-Sent-Events. Events are scoped per-user via `event.userId`; an
++ * optional `?conversationId=` query narrows down to a single conversation.
++ *
++ * Event shapes:
++ *   - `event: status\ndata: { file_id, filename, conversationId, userId, path,
++ *     state, reason?, chars?, chunks?, timestamp }\n\n`
++ *   - `event: session_file\ndata: { conversationId, userId, session_file:
++ *     { session_id, file_id, filename, generated_at }, timestamp }\n\n`
++ *
++ * Listener cleanup happens on `req.on('close')` — required to avoid leaking
++ * listeners on the bus when clients disconnect (browser tab close,
++ * EventSource.close()).
++ *
++ * Auth: relies on the parent router's `requireJwtAuth` middleware to populate
++ * `req.user`. Defensive 401 if missing — never trust the absence of middleware.
++ */
++function statusStreamHandler(req, res) {
++  const userId = req.user && req.user.id;
++  if (!userId) {
++    return res.status(401).json({ error: 'Unauthorized' });
++  }
++
++  const filterConversationId =
++    typeof req.query.conversationId === 'string' && req.query.conversationId.length > 0
++      ? req.query.conversationId
++      : null;
++
++  res.setHeader('Content-Type', 'text/event-stream');
++  res.setHeader('Cache-Control', 'no-cache, no-transform');
++  res.setHeader('Connection', 'keep-alive');
++  res.setHeader('X-Accel-Buffering', 'no');
++  res.flushHeaders();
++
++  // Initial comment line — flushes the response chain through any
++  // intermediate buffer (nginx, browser) so EventSource.onopen fires.
++  safeWrite(res, `: connected ${new Date().toISOString()}\n\n`);
++
++  const matchesScope = (event) => {
++    if (!event || event.userId !== userId) return false;
++    if (filterConversationId == null) return true;
++    // Allow events without conversationId (upload-time, before convo binding).
++    if (event.conversationId == null) return true;
++    return event.conversationId === filterConversationId;
++  };
++
++  const onStatus = (event) => {
++    if (!matchesScope(event)) return;
++    safeWrite(res, `event: status\ndata: ${JSON.stringify(event)}\n\n`);
++  };
++
++  const onSessionFile = (event) => {
++    if (!matchesScope(event)) return;
++    safeWrite(res, `event: session_file\ndata: ${JSON.stringify(event)}\n\n`);
++  };
++
++  statusBus.on('status', onStatus);
++  statusBus.on('session_file', onSessionFile);
++
++  const cleanup = () => {
++    statusBus.off('status', onStatus);
++    statusBus.off('session_file', onSessionFile);
++  };
++  req.on('close', cleanup);
++  req.on('aborted', cleanup);
++}
++
++function safeWrite(res, chunk) {
++  if (res.writableEnded) return;
++  try {
++    res.write(chunk);
++    if (typeof res.flush === 'function') res.flush();
++  } catch (err) {
++    logger.warn(`[statusStream] write failed: ${err && err.message}`);
++  }
++}
++
++module.exports = { statusStreamHandler };
+diff --git a/api/server/routes/files/statusStream.spec.js b/api/server/routes/files/statusStream.spec.js
+new file mode 100644
+index 0000000..3f48db7
+--- /dev/null
++++ b/api/server/routes/files/statusStream.spec.js
+@@ -0,0 +1,196 @@
++jest.mock('@librechat/data-schemas', () => ({
++  logger: { warn: jest.fn(), debug: jest.fn(), info: jest.fn(), error: jest.fn() },
++}));
++
++const { statusStreamHandler } = require('./statusStream');
++const {
++  statusBus,
++  emitStatusUpdate,
++  emitSessionFileUpdate,
++} = require('~/server/services/Files/statusBus');
++
++function makeReq(userId, query = {}) {
++  const handlers = {};
++  return {
++    user: { id: userId },
++    query,
++    on: (evt, cb) => {
++      handlers[evt] = cb;
++    },
++    _trigger: (evt) => handlers[evt] && handlers[evt](),
++  };
++}
++
++function makeRes() {
++  const writes = [];
++  return {
++    headers: {},
++    writableEnded: false,
++    setHeader(k, v) {
++      this.headers[k] = v;
++    },
++    flushHeaders: jest.fn(),
++    write(chunk) {
++      writes.push(chunk);
++    },
++    end() {
++      this.writableEnded = true;
++    },
++    flush: jest.fn(),
++    writes,
++  };
++}
++
++describe('GET /api/files/status-stream', () => {
++  beforeEach(() => {
++    statusBus.removeAllListeners();
++  });
++
++  it('sets SSE headers and a comment flush on connect', () => {
++    const req = makeReq('u1');
++    const res = makeRes();
++    statusStreamHandler(req, res);
++
++    expect(res.headers['Content-Type']).toBe('text/event-stream');
++    expect(res.headers['Cache-Control']).toMatch(/no-cache/);
++    expect(res.headers['Connection']).toBe('keep-alive');
++    expect(res.headers['X-Accel-Buffering']).toBe('no');
++    expect(res.flushHeaders).toHaveBeenCalled();
++    // Initial heartbeat / handshake comment
++    expect(res.writes.join('')).toMatch(/^:.*\n\n/);
++  });
++
++  it('forwards status events to the matching user only', () => {
++    const reqA = makeReq('user-A');
++    const resA = makeRes();
++    const reqB = makeReq('user-B');
++    const resB = makeRes();
++    statusStreamHandler(reqA, resA);
++    statusStreamHandler(reqB, resB);
++
++    emitStatusUpdate({
++      file_id: 'f1',
++      filename: 'a.pdf',
++      conversationId: 'c1',
++      userId: 'user-A',
++      path: 'inline',
++      state: 'loaded',
++      chars: 100,
++      timestamp: '2026-05-06T12:00:00.000Z',
++    });
++
++    const aText = resA.writes.join('');
++    expect(aText).toContain('event: status');
++    expect(aText).toContain('"state":"loaded"');
++    expect(aText).toContain('"file_id":"f1"');
++
++    const bText = resB.writes.join('');
++    expect(bText).not.toContain('"file_id":"f1"');
++  });
++
++  it('forwards session_file events to the matching user', () => {
++    const req = makeReq('user-A');
++    const res = makeRes();
++    statusStreamHandler(req, res);
++
++    emitSessionFileUpdate({
++      conversationId: 'c1',
++      userId: 'user-A',
++      session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' },
++      timestamp: '2026-05-06T12:00:00.000Z',
++    });
++
++    const text = res.writes.join('');
++    expect(text).toContain('event: session_file');
++    expect(text).toContain('"session_id":"A"');
++    expect(text).toContain('"filename":"out.csv"');
++  });
++
++  it('ignores events for other users (cross-user-leak guard)', () => {
++    const req = makeReq('user-A');
++    const res = makeRes();
++    statusStreamHandler(req, res);
++
++    emitStatusUpdate({ file_id: 'leaked', userId: 'user-B', path: 'inline', state: 'loaded' });
++
++    expect(res.writes.join('')).not.toContain('"file_id":"leaked"');
++  });
++
++  it('filters by conversationId when ?conversationId= query is present', () => {
++    const req = makeReq('user-A', { conversationId: 'wanted' });
++    const res = makeRes();
++    statusStreamHandler(req, res);
++
++    emitStatusUpdate({
++      file_id: 'f1',
++      conversationId: 'wanted',
++      userId: 'user-A',
++      path: 'rag',
++      state: 'embedded',
++    });
++    emitStatusUpdate({
++      file_id: 'f2',
++      conversationId: 'unrelated',
++      userId: 'user-A',
++      path: 'rag',
++      state: 'embedded',
++    });
++
++    const text = res.writes.join('');
++    expect(text).toContain('"file_id":"f1"');
++    expect(text).not.toContain('"file_id":"f2"');
++  });
++
++  it('passes events with no conversationId through when filter is set (upload-time events)', () => {
++    const req = makeReq('user-A', { conversationId: 'wanted' });
++    const res = makeRes();
++    statusStreamHandler(req, res);
++
++    emitStatusUpdate({
++      file_id: 'pre-convo',
++      userId: 'user-A',
++      conversationId: undefined,
++      path: 'inline',
++      state: 'loaded',
++    });
++
++    expect(res.writes.join('')).toContain('"file_id":"pre-convo"');
++  });
++
++  it('cleans up listeners on req close (no leak after disconnect)', () => {
++    const req = makeReq('user-A');
++    const res = makeRes();
++    statusStreamHandler(req, res);
++
++    expect(statusBus.listenerCount('status')).toBe(1);
++    expect(statusBus.listenerCount('session_file')).toBe(1);
++
++    req._trigger('close');
++
++    expect(statusBus.listenerCount('status')).toBe(0);
++    expect(statusBus.listenerCount('session_file')).toBe(0);
++  });
++
++  it('does not write after res ends (avoid post-close write errors)', () => {
++    const req = makeReq('user-A');
++    const res = makeRes();
++    statusStreamHandler(req, res);
++    res.writableEnded = true;
++    const before = res.writes.length;
++
++    emitStatusUpdate({ userId: 'user-A', file_id: 'after-close', path: 'inline', state: 'loaded' });
++
++    expect(res.writes.length).toBe(before);
++  });
++
++  it('rejects unauthenticated requests (no req.user)', () => {
++    const req = { query: {}, on: jest.fn() };
++    const res = makeRes();
++    res.status = jest.fn().mockReturnValue(res);
++    res.json = jest.fn().mockReturnValue(res);
++
++    statusStreamHandler(req, res);
++
++    expect(res.status).toHaveBeenCalledWith(401);
++  });
++});
+diff --git a/api/server/services/Files/statusBus.js b/api/server/services/Files/statusBus.js
+new file mode 100644
+index 0000000..4a26dca
+--- /dev/null
++++ b/api/server/services/Files/statusBus.js
+@@ -0,0 +1,32 @@
++const EventEmitter = require('events');
++
++/**
++ * Phase 2 — In-process pub/sub for file-status SSE.
++ *
++ * Two event channels:
++ *   - 'status'        — per-file pathStatus updates (mount/inline/rag).
++ *                       payload shape: { file_id, filename, conversationId,
++ *                       userId, path, state, reason?, chars?, chunks?,
++ *                       timestamp }
++ *   - 'session_file'  — conversation-level session_files updates (Track 2).
++ *                       payload shape: { conversationId, userId, session_file:
++ *                       { session_id, file_id, filename, generated_at },
++ *                       timestamp }
++ *
++ * Subscribers (statusStream route handler) filter by userId and optionally
++ * conversationId — the bus is a fan-out, not an authz layer.
++ *
++ * Single instance per Node process; sized for ~100 concurrent SSE clients.
++ */
++const statusBus = new EventEmitter();
++statusBus.setMaxListeners(100);
++
++function emitStatusUpdate(event) {
++  statusBus.emit('status', event);
++}
++
++function emitSessionFileUpdate(event) {
++  statusBus.emit('session_file', event);
++}
++
++module.exports = { statusBus, emitStatusUpdate, emitSessionFileUpdate };
+diff --git a/api/server/services/Files/statusBus.spec.js b/api/server/services/Files/statusBus.spec.js
+new file mode 100644
+index 0000000..d05ca9e
+--- /dev/null
++++ b/api/server/services/Files/statusBus.spec.js
+@@ -0,0 +1,53 @@
++const { statusBus, emitStatusUpdate, emitSessionFileUpdate } = require('./statusBus');
++
++describe('statusBus', () => {
++  afterEach(() => {
++    statusBus.removeAllListeners();
++  });
++
++  it('emitStatusUpdate broadcasts a status event with the payload', (done) => {
++    const payload = {
++      file_id: 'f1',
++      filename: 'a.pdf',
++      conversationId: 'c1',
++      userId: 'u1',
++      path: 'inline',
++      state: 'loaded',
++      chars: 1234,
++    };
++    statusBus.on('status', (received) => {
++      expect(received).toMatchObject(payload);
++      done();
++    });
++    emitStatusUpdate(payload);
++  });
++
++  it('emitSessionFileUpdate broadcasts a session_file event', (done) => {
++    const payload = {
++      conversationId: 'c1',
++      userId: 'u1',
++      session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' },
++    };
++    statusBus.on('session_file', (received) => {
++      expect(received).toMatchObject(payload);
++      done();
++    });
++    emitSessionFileUpdate(payload);
++  });
++
++  it('multiple listeners receive the same status event', () => {
++    const received = [];
++    statusBus.on('status', (e) => received.push(['l1', e.file_id]));
++    statusBus.on('status', (e) => received.push(['l2', e.file_id]));
++    emitStatusUpdate({ file_id: 'f9' });
++    expect(received).toEqual([
++      ['l1', 'f9'],
++      ['l2', 'f9'],
++    ]);
++  });
++
++  it('does not throw when emitting with no listeners', () => {
++    expect(() => emitStatusUpdate({ file_id: 'lonely' })).not.toThrow();
++    expect(() => emitSessionFileUpdate({ conversationId: 'lonely' })).not.toThrow();
++  });
++});
+diff --git a/api/server/services/Files/updatePathStatus.js b/api/server/services/Files/updatePathStatus.js
+new file mode 100644
+index 0000000..8ba9a2d
+--- /dev/null
++++ b/api/server/services/Files/updatePathStatus.js
+@@ -0,0 +1,70 @@
++const { logger } = require('@librechat/data-schemas');
++const { File } = require('~/db/models');
++const { emitStatusUpdate } = require('./statusBus');
++
++const TERMINAL_STATES = new Set(['ready', 'loaded', 'embedded', 'failed', 'skipped']);
++
++/**
++ * Phase 2 — write a per-path state to `metadata.pathStatus.<path>` on the
++ * File doc and broadcast the change on the SSE bus.
++ *
++ * Used by Phase-3 pipelines (inlinePipeline, ragPipeline) and processCodeOutput
++ * to record routing outcomes. Replaces the raw dotted-key `safeUpdateFile`
++ * pattern from Phase 3 — same on-disk shape, plus a bus emit so the chip-UI
++ * reflects state changes live.
++ *
++ * Best-effort: never throws — the upload path must not break if SSE emit
++ * fails or the file row vanishes between write and lookup.
++ *
++ * @param {string} file_id
++ * @param {'inline'|'rag'|'mount'} path
++ * @param {object} payload
++ * @param {'pending'|'ready'|'loaded'|'embedded'|'failed'|'skipped'} payload.state
++ * @param {string} [payload.reason]
++ * @param {number} [payload.chars]
++ * @param {number} [payload.chunks]
++ */
++async function updatePathStatus(file_id, path, { state, reason, chars, chunks }) {
++  if (!file_id || !path || !state) return;
++
++  const prefix = `metadata.pathStatus.${path}`;
++  const set = { [`${prefix}.state`]: state };
++  if (reason !== undefined && reason !== null) set[`${prefix}.reason`] = reason;
++  if (TERMINAL_STATES.has(state)) set[`${prefix}.completed_at`] = new Date();
++  if (chars !== undefined) set[`${prefix}.chars`] = chars;
++  if (chunks !== undefined) set[`${prefix}.chunks`] = chunks;
++
++  let result;
++  try {
++    result = await File.updateOne({ file_id }, { $set: set, $unset: { expiresAt: '' } });
++  } catch (err) {
++    logger.warn(`[updatePathStatus] write failed for ${file_id}/${path}: ${err && err.message}`);
++    return;
++  }
++
++  if (!result || result.matchedCount === 0) return;
++
++  try {
++    const file = await File.findOne(
++      { file_id },
++      { user: 1, conversationId: 1, filename: 1 },
++    ).lean();
++    if (!file) return;
++    emitStatusUpdate({
++      file_id,
++      filename: file.filename,
++      conversationId: file.conversationId,
++      userId: file.user ? String(file.user) : undefined,
++      path,
++      state,
++      ...(reason !== undefined && reason !== null ? { reason } : {}),
++      ...(chars !== undefined ? { chars } : {}),
++      ...(chunks !== undefined ? { chunks } : {}),
++      timestamp: new Date().toISOString(),
++    });
++  } catch (err) {
++    logger.warn(`[updatePathStatus] emit failed for ${file_id}/${path}: ${err && err.message}`);
++  }
++}
++
++module.exports = { updatePathStatus };
+diff --git a/api/server/services/Files/updatePathStatus.spec.js b/api/server/services/Files/updatePathStatus.spec.js
+new file mode 100644
+index 0000000..0410ec6
+--- /dev/null
++++ b/api/server/services/Files/updatePathStatus.spec.js
+@@ -0,0 +1,125 @@
++const mongoose = require('mongoose');
++const { MongoMemoryServer } = require('mongodb-memory-server');
++
++let mongoServer;
++let File;
++let updatePathStatus;
++let statusBus;
++
++describe('updatePathStatus', () => {
++  beforeAll(async () => {
++    mongoServer = await MongoMemoryServer.create();
++    await mongoose.connect(mongoServer.getUri());
++    ({ File } = require('~/db/models'));
++    ({ updatePathStatus } = require('./updatePathStatus'));
++    ({ statusBus } = require('./statusBus'));
++  });
++
++  afterAll(async () => {
++    await mongoose.disconnect();
++    await mongoServer.stop();
++  });
++
++  beforeEach(async () => {
++    await File.deleteMany({});
++    statusBus.removeAllListeners();
++  });
++
++  const createFile = (file_id, extra = {}) =>
++    File.create({
++      file_id,
++      filename: `${file_id}.pdf`,
++      filepath: `/tmp/${file_id}.pdf`,
++      bytes: 1234,
++      type: 'application/pdf',
++      user: new mongoose.Types.ObjectId(),
++      ...extra,
++    });
++
++  it('writes per-path state with completed_at timestamp', async () => {
++    await createFile('f1');
++    await updatePathStatus('f1', 'inline', { state: 'loaded', chars: 1234 });
++    const f = await File.findOne({ file_id: 'f1' }).lean();
++    expect(f.metadata.pathStatus.inline.state).toBe('loaded');
++    expect(f.metadata.pathStatus.inline.chars).toBe(1234);
++    expect(f.metadata.pathStatus.inline.completed_at).toBeInstanceOf(Date);
++  });
++
++  it('preserves other paths when updating one', async () => {
++    await createFile('f2', {
++      metadata: { pathStatus: { inline: { state: 'loaded', chars: 500 } } },
++    });
++    await updatePathStatus('f2', 'rag', { state: 'embedded', chunks: 8 });
++    const f = await File.findOne({ file_id: 'f2' }).lean();
++    expect(f.metadata.pathStatus.inline.state).toBe('loaded');
++    expect(f.metadata.pathStatus.inline.chars).toBe(500);
++    expect(f.metadata.pathStatus.rag.state).toBe('embedded');
++    expect(f.metadata.pathStatus.rag.chunks).toBe(8);
++  });
++
++  it('writes reason when provided (failure case)', async () => {
++    await createFile('f3');
++    await updatePathStatus('f3', 'inline', { state: 'failed', reason: 'PDF encrypted' });
++    const f = await File.findOne({ file_id: 'f3' }).lean();
++    expect(f.metadata.pathStatus.inline.state).toBe('failed');
++    expect(f.metadata.pathStatus.inline.reason).toBe('PDF encrypted');
++  });
++
++  it('does not write reason field when not provided', async () => {
++    await createFile('f4');
++    await updatePathStatus('f4', 'inline', { state: 'loaded', chars: 100 });
++    const f = await File.findOne({ file_id: 'f4' }).lean();
++    expect(f.metadata.pathStatus.inline.reason).toBeUndefined();
++  });
++
++  it('emits a status event on the SSE bus after successful write', async () => {
++    const file = await createFile('f5', { conversationId: 'conv-1' });
++    const events = [];
++    statusBus.on('status', (e) => events.push(e));
++
++    await updatePathStatus('f5', 'rag', { state: 'embedded', chunks: 12 });
++
++    expect(events).toHaveLength(1);
++    expect(events[0]).toMatchObject({
++      file_id: 'f5',
++      filename: 'f5.pdf',
++      conversationId: 'conv-1',
++      userId: String(file.user),
++      path: 'rag',
++      state: 'embedded',
++      chunks: 12,
++    });
++    expect(events[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
++  });
++
++  it('emits even when conversationId is null (upload-time has no convo yet)', async () => {
++    await createFile('f6'); // no conversationId
++    const events = [];
++    statusBus.on('status', (e) => events.push(e));
++
++    await updatePathStatus('f6', 'inline', { state: 'loaded', chars: 50 });
++
++    expect(events).toHaveLength(1);
++    expect(events[0].file_id).toBe('f6');
++    expect(events[0].conversationId).toBeFalsy();
++  });
++
++  it('does not throw when file_id does not exist (no-op + no emit)', async () => {
++    const events = [];
++    statusBus.on('status', (e) => events.push(e));
++
++    await expect(
++      updatePathStatus('nonexistent', 'inline', { state: 'loaded' }),
++    ).resolves.not.toThrow();
++
++    expect(events).toHaveLength(0);
++  });
++
++  it('does not write completed_at for state=pending', async () => {
++    await createFile('f7');
++    await updatePathStatus('f7', 'rag', { state: 'pending' });
++    const f = await File.findOne({ file_id: 'f7' }).lean();
++    expect(f.metadata.pathStatus.rag.state).toBe('pending');
++    expect(f.metadata.pathStatus.rag.completed_at).toBeUndefined();
++  });
++});
+-- 
+2.47.3
+

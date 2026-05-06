@@ -1,0 +1,1122 @@
+From f6967dc16c3c15d61d48717b9ae1184679101959 Mon Sep 17 00:00:00 2001
+From: pucawo <github@pucawo.de>
+Date: Wed, 6 May 2026 23:39:53 +0200
+Subject: [PATCH 2/3] feat(files): FileStatusChip + SessionFileChip + SSE hook
+ for chip-UI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Frontend half of Phase 2. Two chips and a single SSE subscription per
+FileRow:
+
+- <FileStatusChip pathStatus={…}/>: composes German status text (mount /
+  inline / rag), aggregate color (success / warn / error / pending),
+  tooltip with failure reason. Defensive against undefined / null /
+  empty pathStatus (Pre-Phase-3 file rows / FILE_ROUTING_V2 OFF — S5
+  stale-risk-hoch). Mount-failed (T-34 MIME-Filter) takes priority and
+  surfaces the actionable reason inline.
+
+- <SessionFileChip sessionFile={…}/>: code-generated files from
+  Conversation.session_files (Phase 3 Track 2). Real schema is
+  { session_id, file_id, filename, generated_at } — no path/kind, so
+  one render path, "📦 <filename> · vom Code generiert" + tooltip.
+
+- useFileStatusStream({ enabled, conversationId, initialSessionFiles }):
+  single sse.js connection per FileRow with explicit Bearer token
+  (LibreChat's requireJwtAuth uses header-only auth — native EventSource
+  won't work). Fans out per-file pathStatus updates and conversation-
+  level session_file events. Initial sessionFiles seeded from
+  conversation.session_files; live updates merged with dedup on
+  (session_id, file_id).
+
+- FileContainer renders the chip below the filetype text when path-
+  Status is present (live or cached at upload-time). FileRow mounts
+  the hook once and threads pathStatus down per file_id; renders
+  SessionFileChip row below the file row.
+
+Tests: 50 unit tests (FileStatusChip, SessionFileChip, hook with mock
+sse.js). Existing FileRow tests updated with new mocks.
+
+Phase 2 Tasks 4 + 4b + 5.
+---
+ .../Chat/Input/Files/FileContainer.tsx        |  17 ++
+ .../components/Chat/Input/Files/FileRow.tsx   |  54 ++++-
+ .../Chat/Input/Files/FileStatusChip.tsx       | 169 ++++++++++++++
+ .../Chat/Input/Files/SessionFileChip.tsx      |  38 +++
+ .../Input/Files/__tests__/FileRow.spec.tsx    |   5 +
+ .../Files/__tests__/FileStatusChip.spec.tsx   | 173 ++++++++++++++
+ .../Files/__tests__/SessionFileChip.spec.tsx  |  89 +++++++
+ client/src/hooks/Files/index.ts               |   1 +
+ .../hooks/Files/useFileStatusStream.spec.tsx  | 217 ++++++++++++++++++
+ client/src/hooks/Files/useFileStatusStream.ts | 159 +++++++++++++
+ 10 files changed, 917 insertions(+), 5 deletions(-)
+ create mode 100644 client/src/components/Chat/Input/Files/FileStatusChip.tsx
+ create mode 100644 client/src/components/Chat/Input/Files/SessionFileChip.tsx
+ create mode 100644 client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx
+ create mode 100644 client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx
+ create mode 100644 client/src/hooks/Files/useFileStatusStream.spec.tsx
+ create mode 100644 client/src/hooks/Files/useFileStatusStream.ts
+
+diff --git a/client/src/components/Chat/Input/Files/FileContainer.tsx b/client/src/components/Chat/Input/Files/FileContainer.tsx
+index 5a22fef..a7078c3 100644
+--- a/client/src/components/Chat/Input/Files/FileContainer.tsx
++++ b/client/src/components/Chat/Input/Files/FileContainer.tsx
+@@ -2,6 +2,7 @@ import type { TFile } from 'librechat-data-provider';
+ import type { ExtendedFile } from '~/common';
+ import { getFileType, cn } from '~/utils';
+ import FilePreview from './FilePreview';
++import FileStatusChip, { PathStatus } from './FileStatusChip';
+ import RemoveFile from './RemoveFile';
+ 
+ const FileContainer = ({
+@@ -11,6 +12,7 @@ const FileContainer = ({
+   containerClassName,
+   onDelete,
+   onClick,
++  pathStatus,
+ }: {
+   file: Partial<ExtendedFile | TFile>;
+   overrideType?: string;
+@@ -18,8 +20,18 @@ const FileContainer = ({
+   containerClassName?: string;
+   onDelete?: () => void;
+   onClick?: React.MouseEventHandler<HTMLButtonElement>;
++  pathStatus?: PathStatus | null;
+ }) => {
+   const fileType = getFileType(overrideType ?? file.type);
++  // Phase 2: prefer live SSE status when present, fall back to the value cached
++  // on the file row at upload-time (file.metadata.pathStatus). Pre-Phase-3 rows
++  // have neither — FileStatusChip handles undefined defensively.
++  const fileMetaPathStatus =
++    (file as { metadata?: { pathStatus?: PathStatus } } | undefined)?.metadata?.pathStatus;
++  const mergedPathStatus: PathStatus | null | undefined =
++    pathStatus != null
++      ? { ...(fileMetaPathStatus ?? {}), ...pathStatus }
++      : fileMetaPathStatus;
+ 
+   return (
+     <div
+@@ -48,6 +60,11 @@ const FileContainer = ({
+           </div>
+         </div>
+       </button>
++      {mergedPathStatus !== undefined && (
++        <div className="mt-1">
++          <FileStatusChip pathStatus={mergedPathStatus} />
++        </div>
++      )}
+       {onDelete && <RemoveFile onRemove={onDelete} />}
+     </div>
+   );
+diff --git a/client/src/components/Chat/Input/Files/FileRow.tsx b/client/src/components/Chat/Input/Files/FileRow.tsx
+index ea0b648..5b5e4bb 100644
+--- a/client/src/components/Chat/Input/Files/FileRow.tsx
++++ b/client/src/components/Chat/Input/Files/FileRow.tsx
+@@ -3,8 +3,10 @@ import { useToastContext } from '@librechat/client';
+ import { EToolResources } from 'librechat-data-provider';
+ import type { ExtendedFile } from '~/common';
+ import { useDeleteFilesMutation } from '~/data-provider';
+-import { useFileDeletion } from '~/hooks/Files';
++import { useFileDeletion, useFileStatusStream } from '~/hooks/Files';
++import { useChatContext } from '~/Providers';
+ import FileContainer from './FileContainer';
++import SessionFileChip, { SessionFile } from './SessionFileChip';
+ import { useLocalize } from '~/hooks';
+ import { logger } from '~/utils';
+ import Image from './Image';
+@@ -34,10 +36,26 @@ export default function FileRow({
+ }) {
+   const localize = useLocalize();
+   const { showToast } = useToastContext();
++  const { conversation } = useChatContext();
++  const conversationId = conversation?.conversationId ?? null;
++  // Phase 3 Track 2 wrote `Conversation.session_files` server-side. The type
++  // isn't surfaced on TConversation (data-provider), so we cast defensively.
++  const initialSessionFiles =
++    (conversation as { session_files?: SessionFile[] } | undefined | null)?.session_files ?? [];
++
+   const files = Array.from(_files?.values() ?? []).filter((file) =>
+     fileFilter ? fileFilter(file) : true,
+   );
+ 
++  // Phase 2 — single SSE subscription per FileRow. Enabled when we have a
++  // conversation context (so server can scope events) and either uploaded
++  // files OR pre-existing session_files to track.
++  const { pathStatusByFileId, sessionFiles } = useFileStatusStream({
++    enabled: Boolean(conversationId) && (files.length > 0 || initialSessionFiles.length > 0),
++    conversationId,
++    initialSessionFiles,
++  });
++
+   const { mutateAsync } = useDeleteFilesMutation({
+     onMutate: async () =>
+       logger.log(
+@@ -74,10 +92,25 @@ export default function FileRow({
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [files]);
+ 
+-  if (files.length === 0) {
++  if (files.length === 0 && sessionFiles.length === 0) {
+     return null;
+   }
+ 
++  const renderSessionFiles = () => {
++    if (sessionFiles.length === 0) return null;
++    return (
++      <div
++        className="flex flex-wrap gap-1"
++        style={{ width: '100%', maxWidth: '100%', marginTop: '4px' }}
++        data-testid="session-files-row"
++      >
++        {sessionFiles.map((sf) => (
++          <SessionFileChip key={`${sf.session_id}-${sf.file_id}`} sessionFile={sf} />
++        ))}
++      </div>
++    );
++  };
++
+   const renderFiles = () => {
+     const rowStyle = isRTL
+       ? {
+@@ -139,7 +172,11 @@ export default function FileRow({
+                     source={file.source}
+                   />
+                 ) : (
+-                  <FileContainer file={file} onDelete={handleDelete} />
++                  <FileContainer
++                    file={file}
++                    onDelete={handleDelete}
++                    pathStatus={pathStatusByFileId[file.file_id]}
++                  />
+                 )}
+               </div>
+             );
+@@ -148,9 +185,16 @@ export default function FileRow({
+     );
+   };
+ 
++  const content = (
++    <>
++      {files.length > 0 && renderFiles()}
++      {renderSessionFiles()}
++    </>
++  );
++
+   if (Wrapper) {
+-    return <Wrapper>{renderFiles()}</Wrapper>;
++    return <Wrapper>{content}</Wrapper>;
+   }
+ 
+-  return renderFiles();
++  return content;
+ }
+diff --git a/client/src/components/Chat/Input/Files/FileStatusChip.tsx b/client/src/components/Chat/Input/Files/FileStatusChip.tsx
+new file mode 100644
+index 0000000..ec094e2
+--- /dev/null
++++ b/client/src/components/Chat/Input/Files/FileStatusChip.tsx
+@@ -0,0 +1,169 @@
++import React from 'react';
++import { cn } from '~/utils';
++
++type PathState =
++  | 'pending'
++  | 'ready'
++  | 'loaded'
++  | 'embedded'
++  | 'failed'
++  | 'skipped'
++  | undefined;
++
++interface PathStatusEntry {
++  state?: PathState;
++  reason?: string;
++  chars?: number;
++  chunks?: number;
++  completed_at?: string | Date;
++}
++
++type Path = PathStatusEntry | PathState | null;
++
++export interface PathStatus {
++  mount?: Path;
++  inline?: Path;
++  rag?: Path;
++}
++
++const norm = (p: Path | undefined): PathStatusEntry => {
++  if (p == null) return {};
++  if (typeof p === 'string') return { state: p };
++  return p;
++};
++
++/**
++ * Live status chip for an uploaded file. Reads `metadata.pathStatus` (mount /
++ * inline / rag) and renders one or more localized status fragments joined with
++ * a separator, with an aggregate color (success/warn/error/pending).
++ *
++ * Defensive against three known edge cases:
++ *   1. `pathStatus === undefined` for Pre-Phase-3 file rows (S5 stale-risk).
++ *   2. `pathStatus === {}` while pipelines are still in flight.
++ *   3. `state === 'skipped'` for paths that don't apply to a file (e.g. RAG
++ *      on a small CSV) — rendered silently to avoid clutter.
++ *
++ * Status text is German because the user-base is German-speaking; all copy
++ * is mirrored in the UAT-Playbook (S1-S7) for verification.
++ */
++const FileStatusChip: React.FC<{ pathStatus: PathStatus | null | undefined }> = ({
++  pathStatus,
++}) => {
++  const ps: PathStatus = pathStatus ?? {};
++  const mount = norm(ps.mount);
++  const inline = norm(ps.inline);
++  const rag = norm(ps.rag);
++
++  const knownPaths = [mount, inline, rag].filter((p) => p.state !== undefined);
++  const failedPaths = knownPaths.filter((p) => p.state === 'failed');
++  const successPaths = knownPaths.filter(
++    (p) => p.state === 'ready' || p.state === 'loaded' || p.state === 'embedded',
++  );
++  const pendingPaths = knownPaths.filter((p) => p.state === 'pending');
++
++  // S5 + flag-OFF: nothing to render → generic "verarbeitet" stub.
++  if (knownPaths.length === 0) {
++    return (
++      <span
++        className={cn('file-status-chip', 'chip-pending')}
++        title="Datei wird verarbeitet"
++      >
++        wird verarbeitet …
++      </span>
++    );
++  }
++
++  // Mount failure (e.g. T-34 MIME-Filter reject) trumps everything else: if
++  // the upload itself died, nothing downstream matters and the user needs the
++  // actionable reason front and center.
++  if (mount.state === 'failed') {
++    return (
++      <span
++        className={cn('file-status-chip', 'chip-error')}
++        title={mount.reason || 'Upload abgebrochen'}
++      >
++        ❌ Upload abgebrochen{mount.reason ? `: ${mount.reason}` : ''}
++      </span>
++    );
++  }
++
++  // Terminal failure: every other known path failed (no path produced
++  // anything usable).
++  const allFailed = knownPaths.length > 0 && knownPaths.every((p) => p.state === 'failed');
++  if (allFailed) {
++    const reasons = failedPaths
++      .map((p) => p.reason)
++      .filter((r): r is string => Boolean(r))
++      .join(' / ');
++    return (
++      <span
++        className={cn('file-status-chip', 'chip-error')}
++        title={reasons || 'Datei nicht verarbeitbar'}
++      >
++        ❌ Datei nicht verarbeitbar
++      </span>
++    );
++  }
++
++  const parts: string[] = [];
++  // mount.state === 'failed' is handled by the early return above; here we
++  // only build composite text for partial successes (inline/rag).
++  if (inline.state === 'loaded') {
++    parts.push(
++      inline.chars != null
++        ? `Im Chat-Kontext geladen ✓ (${inline.chars} Zeichen)`
++        : 'Im Chat-Kontext geladen ✓',
++    );
++  }
++  if (inline.state === 'failed') {
++    parts.push(`⚠ Inline-Extraktion fehlgeschlagen${inline.reason ? `: ${inline.reason}` : ''}`);
++  }
++  if (rag.state === 'embedded') {
++    parts.push(
++      rag.chunks != null
++        ? `Wissensbasis indexiert ✓ (${rag.chunks} Chunks)`
++        : 'Wissensbasis indexiert ✓',
++    );
++  }
++  if (rag.state === 'pending') {
++    parts.push('Wissensbasis: indexiert wird …');
++  }
++  if (rag.state === 'failed') {
++    parts.push(`⚠ Indexierung fehlgeschlagen${rag.reason ? `: ${rag.reason}` : ''}`);
++  }
++
++  // Color: any failure → warn, all pending and no success yet → pending,
++  // otherwise success. (allFailed is already handled above.)
++  let colorClass = 'chip-success';
++  if (failedPaths.length > 0) {
++    colorClass = 'chip-warn';
++  } else if (pendingPaths.length > 0 && successPaths.length === 0) {
++    colorClass = 'chip-pending';
++  }
++
++  // Tooltip carries failure reasons (for the warn color); for success we leave it
++  // off so screen readers don't get noisy duplicates of visible chip text.
++  const tooltip =
++    failedPaths.map((p) => p.reason).filter((r): r is string => Boolean(r)).join(' / ') ||
++    undefined;
++
++  if (parts.length === 0) {
++    // Known paths but none in a renderable state (e.g. all skipped).
++    return (
++      <span
++        className={cn('file-status-chip', 'chip-pending')}
++        title="Datei wird verarbeitet"
++      >
++        wird verarbeitet …
++      </span>
++    );
++  }
++
++  return (
++    <span className={cn('file-status-chip', colorClass)} title={tooltip}>
++      {parts.join(' · ')}
++    </span>
++  );
++};
++
++export default FileStatusChip;
+diff --git a/client/src/components/Chat/Input/Files/SessionFileChip.tsx b/client/src/components/Chat/Input/Files/SessionFileChip.tsx
+new file mode 100644
+index 0000000..d59e4a4
+--- /dev/null
++++ b/client/src/components/Chat/Input/Files/SessionFileChip.tsx
+@@ -0,0 +1,38 @@
++import React from 'react';
++import { cn } from '~/utils';
++
++export interface SessionFile {
++  session_id: string;
++  file_id: string;
++  filename: string;
++  generated_at?: string | Date;
++}
++
++/**
++ * Phase 2 Task 4b — chip for files generated by the Code-Interpreter
++ * (Conversation.session_files entries from Phase 3 Track 2).
++ *
++ * These files have NO db.files row — they live only as sub-documents on
++ * the Conversation, surfaced to follow-up `/exec` calls via primeFiles.
++ * The chip exists so users can see at a glance which files the agent has
++ * produced and will reuse on the next code run.
++ *
++ * Schema is stable since Phase 3 Track 2 Task 8:
++ *   { session_id, file_id, filename, generated_at }
++ *
++ * Tooltip carries `session_id` for debugging cross-session lineage.
++ */
++const SessionFileChip: React.FC<{ sessionFile: SessionFile }> = ({ sessionFile }) => {
++  const tooltip = `${sessionFile.filename} (vom Code generiert · session ${sessionFile.session_id})`;
++  return (
++    <span
++      className={cn('file-status-chip', 'chip-success')}
++      title={tooltip}
++      data-session-id={sessionFile.session_id}
++    >
++      📦 {sessionFile.filename} · vom Code generiert
++    </span>
++  );
++};
++
++export default SessionFileChip;
+diff --git a/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
+index 90c1c3a..7cc7a07 100644
+--- a/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
++++ b/client/src/components/Chat/Input/Files/__tests__/FileRow.spec.tsx
+@@ -15,6 +15,11 @@ jest.mock('~/data-provider', () => ({
+ 
+ jest.mock('~/hooks/Files', () => ({
+   useFileDeletion: jest.fn(),
++  useFileStatusStream: jest.fn(() => ({ pathStatusByFileId: {}, sessionFiles: [] })),
++}));
++
++jest.mock('~/Providers', () => ({
++  useChatContext: jest.fn(() => ({ conversation: null })),
+ }));
+ 
+ jest.mock('~/utils', () => ({
+diff --git a/client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx
+new file mode 100644
+index 0000000..950a83f
+--- /dev/null
++++ b/client/src/components/Chat/Input/Files/__tests__/FileStatusChip.spec.tsx
+@@ -0,0 +1,173 @@
++import React from 'react';
++import { render } from '@testing-library/react';
++import '@testing-library/jest-dom';
++import FileStatusChip from '../FileStatusChip';
++
++describe('FileStatusChip', () => {
++  it('renders inline-loaded with char count', () => {
++    const { container } = render(
++      <FileStatusChip pathStatus={{ inline: { state: 'loaded', chars: 1234 } }} />,
++    );
++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
++    expect(container.textContent).toContain('1234');
++  });
++
++  it('renders rag-embedded with chunk count', () => {
++    const { container } = render(
++      <FileStatusChip pathStatus={{ rag: { state: 'embedded', chunks: 8 } }} />,
++    );
++    expect(container.textContent).toContain('Wissensbasis indexiert');
++    expect(container.textContent).toContain('8 Chunks');
++  });
++
++  it('renders rag-pending with progress hint', () => {
++    const { container } = render(
++      <FileStatusChip pathStatus={{ rag: { state: 'pending' } }} />,
++    );
++    expect(container.textContent).toMatch(/indexiert wird/i);
++  });
++
++  it('renders combined inline + rag success', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'loaded', chars: 500 },
++          rag: { state: 'embedded', chunks: 4 },
++        }}
++      />,
++    );
++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
++    expect(container.textContent).toContain('Wissensbasis indexiert');
++  });
++
++  it('shows ❌ for terminal-failure (all paths failed)', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'failed', reason: 'PDF encrypted' },
++          rag: { state: 'failed', reason: 'rag-api 500' },
++        }}
++      />,
++    );
++    expect(container.textContent).toContain('nicht verarbeitbar');
++    expect(container.textContent).toContain('❌');
++  });
++
++  it('shows ⚠ for partial failure (rag failed, inline ok)', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'loaded', chars: 100 },
++          rag: { state: 'failed', reason: 'timeout' },
++        }}
++      />,
++    );
++    expect(container.textContent).toContain('⚠');
++    expect(container.textContent).toMatch(/Indexierung fehlgeschlagen|fehlgeschlagen/);
++  });
++
++  it('renders generic "wird verarbeitet" for empty pathStatus object', () => {
++    const { container } = render(<FileStatusChip pathStatus={{}} />);
++    expect(container.textContent).toMatch(/wird verarbeitet/i);
++  });
++
++  it('S5 stale-risk: renders generic state for undefined pathStatus (Pre-Phase-3 file)', () => {
++    const { container } = render(<FileStatusChip pathStatus={undefined} />);
++    expect(container.textContent).toMatch(/verarbeitet/i);
++  });
++
++  it('S5 stale-risk: renders generic state for null pathStatus', () => {
++    const { container } = render(<FileStatusChip pathStatus={null} />);
++    expect(container.textContent).toMatch(/verarbeitet/i);
++  });
++
++  it('does not throw on undefined input (S5 regression guard)', () => {
++    expect(() => render(<FileStatusChip pathStatus={undefined} />)).not.toThrow();
++  });
++
++  it('handles short-form state strings (inline === "loaded" instead of object)', () => {
++    const { container } = render(
++      <FileStatusChip pathStatus={{ inline: 'loaded' as any, rag: 'embedded' as any }} />,
++    );
++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
++    expect(container.textContent).toContain('Wissensbasis indexiert');
++  });
++
++  it('renders mount-failed when explicit mount: failed is set', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{ mount: { state: 'failed', reason: 'MIME-Filter Reject' } }}
++      />,
++    );
++    expect(container.textContent).toContain('Upload abgebrochen');
++    expect(container.textContent).toContain('MIME-Filter');
++  });
++
++  it('renders rag-skipped silently (no clutter for non-applicable paths)', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'loaded', chars: 50 },
++          rag: { state: 'skipped' },
++        }}
++      />,
++    );
++    expect(container.textContent).toContain('Im Chat-Kontext geladen');
++    expect(container.textContent).not.toMatch(/skipped/i);
++  });
++
++  it('exposes a tooltip with the reason on failure', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{ rag: { state: 'failed', reason: 'rag-api unreachable' } }}
++      />,
++    );
++    const chip = container.querySelector('.file-status-chip');
++    expect(chip).toBeTruthy();
++    // Title attribute carries the reason for hover-tooltip.
++    expect(chip?.getAttribute('title') ?? '').toMatch(/rag-api unreachable/);
++  });
++
++  it('uses chip-success class when all known paths are healthy', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'loaded', chars: 100 },
++          rag: { state: 'embedded', chunks: 5 },
++        }}
++      />,
++    );
++    expect(container.querySelector('.chip-success')).toBeTruthy();
++  });
++
++  it('uses chip-warn class when at least one path failed but others succeeded', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'loaded', chars: 100 },
++          rag: { state: 'failed', reason: 'x' },
++        }}
++      />,
++    );
++    expect(container.querySelector('.chip-warn')).toBeTruthy();
++  });
++
++  it('uses chip-error class when every path failed', () => {
++    const { container } = render(
++      <FileStatusChip
++        pathStatus={{
++          inline: { state: 'failed', reason: 'a' },
++          rag: { state: 'failed', reason: 'b' },
++        }}
++      />,
++    );
++    expect(container.querySelector('.chip-error')).toBeTruthy();
++  });
++
++  it('uses chip-pending class while still in flight', () => {
++    const { container } = render(
++      <FileStatusChip pathStatus={{ rag: { state: 'pending' } }} />,
++    );
++    expect(container.querySelector('.chip-pending')).toBeTruthy();
++  });
++});
+diff --git a/client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx b/client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx
+new file mode 100644
+index 0000000..55d7bdd
+--- /dev/null
++++ b/client/src/components/Chat/Input/Files/__tests__/SessionFileChip.spec.tsx
+@@ -0,0 +1,89 @@
++import React from 'react';
++import { render } from '@testing-library/react';
++import '@testing-library/jest-dom';
++import SessionFileChip from '../SessionFileChip';
++
++describe('SessionFileChip', () => {
++  it('renders the filename and "vom Code generiert" badge', () => {
++    const { container } = render(
++      <SessionFileChip
++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: 'out.csv' }}
++      />,
++    );
++    expect(container.textContent).toContain('out.csv');
++    expect(container.textContent).toMatch(/vom Code generiert/i);
++  });
++
++  it('puts the session_id in the tooltip for debugging', () => {
++    const { container } = render(
++      <SessionFileChip
++        sessionFile={{
++          session_id: 'session-abc',
++          file_id: 'f1',
++          filename: 'a.txt',
++        }}
++      />,
++    );
++    const chip = container.querySelector('.file-status-chip');
++    expect(chip?.getAttribute('title') ?? '').toContain('session-abc');
++  });
++
++  it('renders the package icon prefix', () => {
++    const { container } = render(
++      <SessionFileChip
++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: 'out.csv' }}
++      />,
++    );
++    expect(container.textContent).toContain('📦');
++  });
++
++  it('uses chip-success styling (success state for generated files)', () => {
++    const { container } = render(
++      <SessionFileChip
++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: 'out.csv' }}
++      />,
++    );
++    expect(container.querySelector('.chip-success')).toBeTruthy();
++  });
++
++  it('does not throw when generated_at is provided as a Date', () => {
++    expect(() =>
++      render(
++        <SessionFileChip
++          sessionFile={{
++            session_id: 'A',
++            file_id: 'f1',
++            filename: 'a.csv',
++            generated_at: new Date('2026-05-06T12:00:00Z'),
++          }}
++        />,
++      ),
++    ).not.toThrow();
++  });
++
++  it('does not throw when generated_at is provided as ISO string', () => {
++    expect(() =>
++      render(
++        <SessionFileChip
++          sessionFile={{
++            session_id: 'A',
++            file_id: 'f1',
++            filename: 'a.csv',
++            generated_at: '2026-05-06T12:00:00Z',
++          }}
++        />,
++      ),
++    ).not.toThrow();
++  });
++
++  it('truncates long filenames in the title attribute (so tooltip shows full name)', () => {
++    const longName = 'a-very-long-export-from-pandas-2026-05-06-final-final.csv';
++    const { container } = render(
++      <SessionFileChip
++        sessionFile={{ session_id: 'A', file_id: 'f1', filename: longName }}
++      />,
++    );
++    const chip = container.querySelector('.file-status-chip');
++    expect(chip?.getAttribute('title') ?? '').toContain(longName);
++  });
++});
+diff --git a/client/src/hooks/Files/index.ts b/client/src/hooks/Files/index.ts
+index df86c02..1de0881 100644
+--- a/client/src/hooks/Files/index.ts
++++ b/client/src/hooks/Files/index.ts
+@@ -9,3 +9,4 @@ export { default as useSharePointPicker } from './useSharePointPicker';
+ export { default as useSharePointDownload } from './useSharePointDownload';
+ export { default as useSharePointFileHandling } from './useSharePointFileHandling';
+ export { default as useSharePointToken } from './useSharePointToken';
++export { default as useFileStatusStream } from './useFileStatusStream';
+diff --git a/client/src/hooks/Files/useFileStatusStream.spec.tsx b/client/src/hooks/Files/useFileStatusStream.spec.tsx
+new file mode 100644
+index 0000000..f53cf9c
+--- /dev/null
++++ b/client/src/hooks/Files/useFileStatusStream.spec.tsx
+@@ -0,0 +1,217 @@
++import React from 'react';
++import { renderHook, act } from '@testing-library/react';
++import '@testing-library/jest-dom';
++
++let sseInstances: MockSSE[] = [];
++
++class MockSSE {
++  url: string;
++  options: any;
++  listeners: Record<string, ((e: any) => void)[]> = {};
++  closed = false;
++  streamCalled = false;
++
++  constructor(url: string, options: any) {
++    this.url = url;
++    this.options = options;
++    sseInstances.push(this);
++  }
++  addEventListener(name: string, cb: (e: any) => void) {
++    if (!this.listeners[name]) this.listeners[name] = [];
++    this.listeners[name].push(cb);
++  }
++  removeEventListener(name: string, cb: (e: any) => void) {
++    this.listeners[name] = (this.listeners[name] ?? []).filter((l) => l !== cb);
++  }
++  stream() {
++    this.streamCalled = true;
++  }
++  close() {
++    this.closed = true;
++  }
++  dispatch(name: string, data: unknown) {
++    (this.listeners[name] ?? []).forEach((cb) => cb({ data: JSON.stringify(data) }));
++  }
++}
++
++jest.mock('sse.js', () => ({ SSE: jest.fn() }));
++const sseModule = jest.requireMock('sse.js') as { SSE: jest.Mock };
++
++let mockToken = 'tok-abc';
++let mockAuthenticated = true;
++jest.mock('~/hooks/AuthContext', () => ({
++  useAuthContext: () => ({ token: mockToken, isAuthenticated: mockAuthenticated }),
++}));
++
++import useFileStatusStream from './useFileStatusStream';
++
++describe('useFileStatusStream', () => {
++  beforeEach(() => {
++    sseInstances = [];
++    sseModule.SSE.mockImplementation((url: string, opts: any) => new MockSSE(url, opts));
++    mockToken = 'tok-abc';
++    mockAuthenticated = true;
++  });
++
++  it('opens an SSE connection with bearer token when enabled', () => {
++    renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++    expect(sseInstances).toHaveLength(1);
++    expect(sseInstances[0].url).toBe('/api/files/status-stream?conversationId=c1');
++    expect(sseInstances[0].options.headers.Authorization).toBe('Bearer tok-abc');
++    expect(sseInstances[0].streamCalled).toBe(true);
++  });
++
++  it('opens without conversationId param when none provided', () => {
++    renderHook(() => useFileStatusStream({ enabled: true }));
++    expect(sseInstances[0].url).toBe('/api/files/status-stream');
++  });
++
++  it('does not open SSE when enabled=false', () => {
++    renderHook(() => useFileStatusStream({ enabled: false, conversationId: 'c1' }));
++    expect(sseInstances).toHaveLength(0);
++  });
++
++  it('does not open SSE when not authenticated', () => {
++    mockAuthenticated = false;
++    renderHook(() => useFileStatusStream({ enabled: true, conversationId: 'c1' }));
++    expect(sseInstances).toHaveLength(0);
++  });
++
++  it('updates pathStatusByFileId on status events', () => {
++    const { result } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++    expect(result.current.pathStatusByFileId).toEqual({});
++
++    act(() => {
++      sseInstances[0].dispatch('status', {
++        file_id: 'f1',
++        path: 'inline',
++        state: 'loaded',
++        chars: 1234,
++      });
++    });
++
++    expect(result.current.pathStatusByFileId['f1']).toEqual({
++      inline: { state: 'loaded', chars: 1234 },
++    });
++  });
++
++  it('merges multiple paths for the same file', () => {
++    const { result } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++
++    act(() => {
++      sseInstances[0].dispatch('status', {
++        file_id: 'f1',
++        path: 'inline',
++        state: 'loaded',
++        chars: 100,
++      });
++      sseInstances[0].dispatch('status', {
++        file_id: 'f1',
++        path: 'rag',
++        state: 'embedded',
++        chunks: 5,
++      });
++    });
++
++    expect(result.current.pathStatusByFileId['f1']).toEqual({
++      inline: { state: 'loaded', chars: 100 },
++      rag: { state: 'embedded', chunks: 5 },
++    });
++  });
++
++  it('appends session_file events with dedup on (session_id, file_id)', () => {
++    const { result } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++
++    act(() => {
++      sseInstances[0].dispatch('session_file', {
++        conversationId: 'c1',
++        session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' },
++      });
++      sseInstances[0].dispatch('session_file', {
++        conversationId: 'c1',
++        session_file: { session_id: 'A', file_id: 'f1', filename: 'out.csv' }, // dup
++      });
++      sseInstances[0].dispatch('session_file', {
++        conversationId: 'c1',
++        session_file: { session_id: 'A', file_id: 'f2', filename: 'out2.csv' },
++      });
++    });
++
++    expect(result.current.sessionFiles).toHaveLength(2);
++    expect(result.current.sessionFiles.map((s) => s.file_id)).toEqual(['f1', 'f2']);
++  });
++
++  it('seeds session_files from initialSessionFiles prop and merges with live', () => {
++    const { result } = renderHook(() =>
++      useFileStatusStream({
++        enabled: true,
++        conversationId: 'c1',
++        initialSessionFiles: [
++          { session_id: 'old', file_id: 'fOld', filename: 'old.csv' },
++        ],
++      }),
++    );
++
++    expect(result.current.sessionFiles).toHaveLength(1);
++    expect(result.current.sessionFiles[0].file_id).toBe('fOld');
++
++    act(() => {
++      sseInstances[0].dispatch('session_file', {
++        session_file: { session_id: 'new', file_id: 'fNew', filename: 'new.csv' },
++      });
++    });
++
++    expect(result.current.sessionFiles).toHaveLength(2);
++    expect(result.current.sessionFiles.map((s) => s.file_id).sort()).toEqual(['fNew', 'fOld']);
++  });
++
++  it('closes the SSE connection on unmount', () => {
++    const { unmount } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++    expect(sseInstances[0].closed).toBe(false);
++    unmount();
++    expect(sseInstances[0].closed).toBe(true);
++  });
++
++  it('ignores malformed JSON in events without crashing', () => {
++    const { result } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++    act(() => {
++      const cb = sseInstances[0].listeners['status']?.[0];
++      expect(() => cb && cb({ data: 'not-json{' })).not.toThrow();
++    });
++    expect(result.current.pathStatusByFileId).toEqual({});
++  });
++
++  it('ignores status events missing file_id or path', () => {
++    const { result } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++    act(() => {
++      sseInstances[0].dispatch('status', { state: 'loaded' });
++      sseInstances[0].dispatch('status', { file_id: 'f1', state: 'loaded' });
++    });
++    expect(result.current.pathStatusByFileId).toEqual({});
++  });
++
++  it('survives SSE constructor throw and returns empty maps', () => {
++    sseModule.SSE.mockImplementationOnce(() => {
++      throw new Error('CSP block');
++    });
++    const { result } = renderHook(() =>
++      useFileStatusStream({ enabled: true, conversationId: 'c1' }),
++    );
++    expect(result.current.pathStatusByFileId).toEqual({});
++    expect(result.current.sessionFiles).toEqual([]);
++  });
++});
+diff --git a/client/src/hooks/Files/useFileStatusStream.ts b/client/src/hooks/Files/useFileStatusStream.ts
+new file mode 100644
+index 0000000..46cf036
+--- /dev/null
++++ b/client/src/hooks/Files/useFileStatusStream.ts
+@@ -0,0 +1,159 @@
++import { useEffect, useRef, useState, useMemo } from 'react';
++import { SSE } from 'sse.js';
++import { useAuthContext } from '~/hooks/AuthContext';
++import type { PathStatus } from '~/components/Chat/Input/Files/FileStatusChip';
++import type { SessionFile } from '~/components/Chat/Input/Files/SessionFileChip';
++
++interface StatusEvent {
++  file_id: string;
++  filename?: string;
++  conversationId?: string;
++  userId?: string;
++  path: 'inline' | 'rag' | 'mount';
++  state: NonNullable<PathStatus['inline']>;
++  reason?: string;
++  chars?: number;
++  chunks?: number;
++  timestamp?: string;
++}
++
++interface SessionFileEvent {
++  conversationId?: string;
++  userId?: string;
++  session_file: SessionFile;
++  timestamp?: string;
++}
++
++interface UseFileStatusStreamArgs {
++  enabled: boolean;
++  conversationId?: string | null;
++  initialSessionFiles?: SessionFile[];
++}
++
++interface UseFileStatusStreamResult {
++  pathStatusByFileId: Record<string, PathStatus>;
++  sessionFiles: SessionFile[];
++}
++
++/**
++ * Phase 2 — single SSE subscription to /api/files/status-stream that fans out
++ * pathStatus updates per file_id and conversation-level session_file events.
++ *
++ * Auth: passes the JWT bearer token explicitly via sse.js headers (native
++ * EventSource cannot, since LibreChat's requireJwtAuth middleware reads from
++ * the Authorization header only — see api/strategies/jwtStrategy.js).
++ *
++ * Defensive when:
++ *   - FILE_ROUTING_V2 flag is OFF on the backend → no pathStatus events
++ *     emitted; the hook simply returns empty maps. Existing UI keeps working.
++ *   - Token is missing / connection fails → the catch swallows it; UI degrades
++ *     gracefully to "no live updates" rather than crashing.
++ *   - Connection drops → sse.js reconnects automatically via stream events,
++ *     but state can be lost. Acceptable per Phase-2 plan; full reload-recovery
++ *     via REST is Phase-3 backlog.
++ *
++ * Single connection per consumer — mount this hook once at the FileRow level,
++ * not per individual chip, to stay under the browser's HTTP/2 stream cap.
++ */
++export default function useFileStatusStream({
++  enabled,
++  conversationId,
++  initialSessionFiles,
++}: UseFileStatusStreamArgs): UseFileStatusStreamResult {
++  const { token, isAuthenticated } = useAuthContext();
++  const [pathStatusByFileId, setPathStatusByFileId] = useState<Record<string, PathStatus>>({});
++  const [liveSessionFiles, setLiveSessionFiles] = useState<SessionFile[]>([]);
++  const sseRef = useRef<SSE | null>(null);
++
++  useEffect(() => {
++    if (!enabled || !isAuthenticated || !token) return;
++
++    const url = conversationId
++      ? `/api/files/status-stream?conversationId=${encodeURIComponent(conversationId)}`
++      : '/api/files/status-stream';
++
++    let sse: SSE | null = null;
++    try {
++      sse = new SSE(url, {
++        headers: { Authorization: `Bearer ${token}` },
++        method: 'GET',
++      });
++      sseRef.current = sse;
++    } catch (err) {
++      // sse.js constructor failures (CSP, blocked etc.) — swallow, no live UX.
++      // Logged via the data-provider logger if available; otherwise just bail.
++      // eslint-disable-next-line no-console
++      console.warn('[useFileStatusStream] failed to open SSE:', err);
++      return;
++    }
++
++    const onStatus = (e: MessageEvent) => {
++      try {
++        const evt: StatusEvent = JSON.parse(e.data);
++        if (!evt.file_id || !evt.path) return;
++        setPathStatusByFileId((prev) => {
++          const current = prev[evt.file_id] ?? {};
++          const entry: Record<string, unknown> = { state: evt.state };
++          if (evt.reason !== undefined) entry.reason = evt.reason;
++          if (evt.chars !== undefined) entry.chars = evt.chars;
++          if (evt.chunks !== undefined) entry.chunks = evt.chunks;
++          return {
++            ...prev,
++            [evt.file_id]: { ...current, [evt.path]: entry },
++          };
++        });
++      } catch {
++        /* malformed event — ignore */
++      }
++    };
++
++    const onSessionFile = (e: MessageEvent) => {
++      try {
++        const evt: SessionFileEvent = JSON.parse(e.data);
++        const sf = evt.session_file;
++        if (!sf || !sf.file_id || !sf.session_id) return;
++        setLiveSessionFiles((prev) => {
++          if (prev.some((p) => p.session_id === sf.session_id && p.file_id === sf.file_id)) {
++            return prev;
++          }
++          return [...prev, sf];
++        });
++      } catch {
++        /* malformed event — ignore */
++      }
++    };
++
++    sse.addEventListener('status', onStatus);
++    sse.addEventListener('session_file', onSessionFile);
++    sse.stream();
++
++    return () => {
++      try {
++        sse?.removeEventListener('status', onStatus);
++        sse?.removeEventListener('session_file', onSessionFile);
++        sse?.close();
++      } catch {
++        /* connection already closed — ignore */
++      }
++      sseRef.current = null;
++    };
++  }, [enabled, isAuthenticated, token, conversationId]);
++
++  // Merge initial (server-rendered) session_files with live SSE updates.
++  // Live entries take precedence on (session_id, file_id) collision since
++  // they reflect the most recent register.
++  const sessionFiles = useMemo(() => {
++    const merged = [...(initialSessionFiles ?? [])];
++    const seen = new Set(merged.map((s) => `${s.session_id}::${s.file_id}`));
++    for (const live of liveSessionFiles) {
++      const key = `${live.session_id}::${live.file_id}`;
++      if (!seen.has(key)) {
++        merged.push(live);
++        seen.add(key);
++      }
++    }
++    return merged;
++  }, [initialSessionFiles, liveSessionFiles]);
++
++  return { pathStatusByFileId, sessionFiles };
++}
+-- 
+2.47.3
+
