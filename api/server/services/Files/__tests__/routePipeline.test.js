@@ -44,7 +44,7 @@ describe('maybeRunV2Pipeline', () => {
     process.env.FILE_ROUTING_V2 = 'true';
     const args = { ...baseArgs(), tool_resource: EToolResources.context };
     await maybeRunV2Pipeline(args);
-    expect(runInlinePipeline).toHaveBeenCalledWith(args.file, args.result, args.conversationId);
+    expect(runInlinePipeline).toHaveBeenCalledWith(args.req, args.file, args.result, args.conversationId);
     expect(runRagPipeline).toHaveBeenCalledWith(
       args.req,
       args.file,

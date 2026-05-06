@@ -15,6 +15,9 @@ const { extractInlineText } = require('./inlineExtract');
  * has already happened by the time we run; this is a separate caching step
  * whose absence must not break the upload.
  *
+ * @param {import('express').Request} req - needed to generate the short-lived
+ *        JWT for rag-api `/text` (mirrors uploadVectors pattern). Without `req`
+ *        the call falls back to no-Authorization, which prod rag-api rejects 401.
  * @param {{ path?: string, mimetype?: string, size?: number, originalname?: string }} file
  * @param {{ file_id?: string, filename?: string }} fileResult - the createFile result
  * @param {string} [conversationId] - usually undefined at upload time (FE
@@ -22,7 +25,7 @@ const { extractInlineText } = require('./inlineExtract');
  *        FilePathFailure schema marks it required.
  * @returns {Promise<void>}
  */
-async function runInlinePipeline(file, fileResult, conversationId) {
+async function runInlinePipeline(req, file, fileResult, conversationId) {
   if (!file || file.mimetype == null || file.size == null) return;
   if (!fileResult || !fileResult.file_id) return;
 
@@ -34,7 +37,12 @@ async function runInlinePipeline(file, fileResult, conversationId) {
 
   let extracted;
   try {
-    extracted = await extractInlineText({ filepath: file.path, filename, file_id });
+    extracted = await extractInlineText({
+      filepath: file.path,
+      filename,
+      file_id,
+      userId: req?.user?.id,
+    });
   } catch (err) {
     const reason = err && err.message ? err.message : String(err);
     logger.warn(`[runInlinePipeline] extract failed for ${file_id}: ${reason}`);

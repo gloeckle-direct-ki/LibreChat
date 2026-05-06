@@ -1,6 +1,10 @@
 const fs = require('fs');
 const axios = require('axios');
 const FormData = require('form-data');
+// `generateShortLivedToken` is lazy-required inside the function below.
+// Top-level require of `@librechat/api` pulls winston-daily-rotate-file, which
+// fails to initialize in jest's test environment. Lazy-require keeps test-load
+// clean while still using the same auth pattern as VectorDB/crud.js at runtime.
 
 /**
  * Extract text from a freshly uploaded file via rag-api.
@@ -21,11 +25,15 @@ const FormData = require('form-data');
  * @param {string} params.filename - Original filename (sent to rag-api)
  * @param {string} params.file_id  - File-id (rag-api requires this as Form field)
  * @param {string} [params.entity_id]
+ * @param {string} [params.userId]   - Owning user id; generates the short-lived
+ *        JWT that rag-api requires on `Authorization: Bearer …`. Mirrors the
+ *        auth pattern used by uploadVectors (VectorDB/crud.js). Optional only
+ *        for backwards-compat — without it, prod rag-api returns 401.
  * @returns {Promise<{ text: string, chars: number, filename: string }>}
  * @throws when RAG_API_URL is unset, the upstream call fails, or
  *         `known_type === false` (unsupported MIME).
  */
-async function extractInlineText({ filepath, filename, file_id, entity_id }) {
+async function extractInlineText({ filepath, filename, file_id, entity_id, userId }) {
   if (!process.env.RAG_API_URL) {
     throw new Error('RAG_API_URL not defined');
   }
@@ -37,8 +45,14 @@ async function extractInlineText({ filepath, filename, file_id, entity_id }) {
     form.append('entity_id', entity_id);
   }
 
+  const headers = form.getHeaders ? form.getHeaders() : {};
+  if (userId) {
+    const { generateShortLivedToken } = require('@librechat/api');
+    headers.Authorization = `Bearer ${generateShortLivedToken(userId)}`;
+  }
+
   const response = await axios.post(`${process.env.RAG_API_URL}/text`, form, {
-    headers: form.getHeaders ? form.getHeaders() : {},
+    headers,
     timeout: 60_000,
     maxBodyLength: Infinity,
     maxContentLength: Infinity,

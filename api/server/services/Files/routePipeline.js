@@ -25,7 +25,7 @@ async function maybeRunV2Pipeline({ req, file, result, conversationId, tool_reso
   if (tool_resource === EToolResources.file_search) {
     return;
   }
-  await runInlinePipeline(file, result, conversationId);
+  await runInlinePipeline(req, file, result, conversationId);
   await runRagPipeline(req, file, result, conversationId, entity_id);
 }
 

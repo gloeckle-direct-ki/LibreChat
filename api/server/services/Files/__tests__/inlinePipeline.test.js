@@ -30,12 +30,13 @@ describe('runInlinePipeline', () => {
     it('extracts text and caches it on the File doc', async () => {
       extractInlineText.mockResolvedValue({ text: 'Hallo Welt', chars: 10, filename: 'x.pdf' });
 
-      await runInlinePipeline(file, fileResult, 'conv-1');
+      await runInlinePipeline(null, file, fileResult, 'conv-1');
 
       expect(extractInlineText).toHaveBeenCalledWith({
         filepath: '/tmp/x.pdf',
         filename: 'x.pdf',
         file_id: 'f-1',
+        userId: undefined,
       });
       expect(updateFile).toHaveBeenCalledTimes(1);
       const updateArg = updateFile.mock.calls[0][0];
@@ -50,7 +51,7 @@ describe('runInlinePipeline', () => {
     it('on extract-failure: writes pathStatus.inline.failed + records telemetry', async () => {
       extractInlineText.mockRejectedValue(new Error('rag-api 500'));
 
-      await runInlinePipeline(file, fileResult, 'conv-1');
+      await runInlinePipeline(null, file, fileResult, 'conv-1');
 
       expect(updateFile).toHaveBeenCalledTimes(1);
       const updateArg = updateFile.mock.calls[0][0];
@@ -69,7 +70,7 @@ describe('runInlinePipeline', () => {
     it('on extract-failure without conversationId: writes status but skips telemetry', async () => {
       extractInlineText.mockRejectedValue(new Error('rag-api 500'));
 
-      await runInlinePipeline(file, fileResult, undefined);
+      await runInlinePipeline(null, file, fileResult, undefined);
 
       expect(updateFile).toHaveBeenCalledTimes(1);
       expect(recordFilePathFailure).not.toHaveBeenCalled();
@@ -79,7 +80,7 @@ describe('runInlinePipeline', () => {
       extractInlineText.mockResolvedValue({ text: 'Hallo', chars: 5, filename: 'x.pdf' });
       updateFile.mockRejectedValue(new Error('mongo unreachable'));
 
-      await expect(runInlinePipeline(file, fileResult, 'conv-1')).resolves.toBeUndefined();
+      await expect(runInlinePipeline(null, file, fileResult, 'conv-1')).resolves.toBeUndefined();
     });
   });
 
@@ -88,7 +89,7 @@ describe('runInlinePipeline', () => {
       const file = { path: '/tmp/a.zip', mimetype: 'application/zip', size: 200_000 };
       const fileResult = { file_id: 'f-zip', filename: 'a.zip' };
 
-      await runInlinePipeline(file, fileResult, 'conv-1');
+      await runInlinePipeline(null, file, fileResult, 'conv-1');
 
       expect(extractInlineText).not.toHaveBeenCalled();
       expect(updateFile).not.toHaveBeenCalled();
@@ -99,7 +100,7 @@ describe('runInlinePipeline', () => {
       const file = { path: '/tmp/big.pdf', mimetype: 'application/pdf', size: 100_000 };
       const fileResult = { file_id: 'f-big', filename: 'big.pdf' };
 
-      await runInlinePipeline(file, fileResult, 'conv-1');
+      await runInlinePipeline(null, file, fileResult, 'conv-1');
 
       expect(extractInlineText).not.toHaveBeenCalled();
       expect(updateFile).not.toHaveBeenCalled();
@@ -109,7 +110,7 @@ describe('runInlinePipeline', () => {
       const file = { path: '/tmp/p.png', mimetype: 'image/png', size: 1_000 };
       const fileResult = { file_id: 'f-img', filename: 'p.png' };
 
-      await runInlinePipeline(file, fileResult, 'conv-1');
+      await runInlinePipeline(null, file, fileResult, 'conv-1');
 
       expect(extractInlineText).not.toHaveBeenCalled();
       expect(updateFile).not.toHaveBeenCalled();
@@ -120,9 +121,10 @@ describe('runInlinePipeline', () => {
     it('no-ops if fileResult lacks file_id', async () => {
       const file = { path: '/tmp/x.pdf', mimetype: 'application/pdf', size: 5_000 };
 
-      await runInlinePipeline(file, { filename: 'x.pdf' }, 'conv-1');
-      await runInlinePipeline(file, null, 'conv-1');
-      await runInlinePipeline(file, undefined, 'conv-1');
+      await runInlinePipeline(null, file, { filename: 'x.pdf' }, 'conv-1');
+      await runInlinePipeline(null, file, null, 'conv-1');
+      await runInlinePipeline(null, file, undefined, 'conv-1');
+
 
       expect(extractInlineText).not.toHaveBeenCalled();
       expect(updateFile).not.toHaveBeenCalled();
@@ -131,9 +133,9 @@ describe('runInlinePipeline', () => {
     it('no-ops if file lacks mimetype or size', async () => {
       const fileResult = { file_id: 'f-1', filename: 'x.pdf' };
 
-      await runInlinePipeline({ path: '/tmp/x.pdf', size: 5_000 }, fileResult, 'conv-1');
-      await runInlinePipeline({ path: '/tmp/x.pdf', mimetype: 'application/pdf' }, fileResult, 'conv-1');
-      await runInlinePipeline(null, fileResult, 'conv-1');
+      await runInlinePipeline(null, { path: '/tmp/x.pdf', size: 5_000 }, fileResult, 'conv-1');
+      await runInlinePipeline(null, { path: '/tmp/x.pdf', mimetype: 'application/pdf' }, fileResult, 'conv-1');
+      await runInlinePipeline(null, null, fileResult, 'conv-1');
 
       expect(extractInlineText).not.toHaveBeenCalled();
     });
