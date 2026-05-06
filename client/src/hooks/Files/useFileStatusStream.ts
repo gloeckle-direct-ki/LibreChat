@@ -71,12 +71,20 @@ export default function useFileStatusStream({
   // the scope synchronously in a ref and gate the *returned* values on
   // a match, so the very first render of a new scope yields empty maps
   // even before the effect's reset has flushed.
-  const scopeRef = useRef<{ conversationId: string | null | undefined; token: string | null }>(
+  //
+  // codex polish-iter-3: BOTH sides of the comparison must use the same
+  // normalization. The effect writes `?? null` (line below); the render
+  // gate must do the same, otherwise `null === undefined` for callers
+  // that pass no conversationId would keep `scopeMatches` permanently
+  // false and silently swallow every status / session_file event.
+  const scopeRef = useRef<{ conversationId: string | null; token: string | null }>(
     { conversationId: null, token: null },
   );
+  const normalizedConversationId = conversationId ?? null;
+  const normalizedToken = token ?? null;
   const scopeMatches =
-    scopeRef.current.conversationId === conversationId &&
-    scopeRef.current.token === token;
+    scopeRef.current.conversationId === normalizedConversationId &&
+    scopeRef.current.token === normalizedToken;
 
   useEffect(() => {
     // Fresh connection = fresh state. Prevents chips from one conversation
@@ -87,7 +95,7 @@ export default function useFileStatusStream({
     // (post-reset) is what flips `scopeMatches` true on the next render.
     setPathStatusByFileId({});
     setLiveSessionFiles([]);
-    scopeRef.current = { conversationId: conversationId ?? null, token: token ?? null };
+    scopeRef.current = { conversationId: normalizedConversationId, token: normalizedToken };
 
     if (!enabled || !isAuthenticated || !token) return;
 

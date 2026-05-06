@@ -365,5 +365,64 @@ describe('useFileStatusStream', () => {
       const violations = observed.filter((o) => o.cid === 'c2' && o.sessionFiles > 0);
       expect(violations).toEqual([]);
     });
+
+    // codex polish-iter-2 review re-pass found a P2 regression: scopeRef was
+    // written with `?? null` but the render-side compared raw values.
+    // For `conversationId: undefined`, `null === undefined` stayed false
+    // forever, silently dropping every event from the return value.
+    it('iter-3 regression — exposes events when conversationId is undefined', () => {
+      const { result } = renderHook(() =>
+        useFileStatusStream({ enabled: true /* conversationId: undefined */ }),
+      );
+      expect(sseInstances).toHaveLength(1);
+
+      act(() => {
+        sseInstances[0].dispatch('status', {
+          file_id: 'no-convo',
+          path: 'inline',
+          state: 'loaded',
+          chars: 5,
+        });
+        sseInstances[0].dispatch('session_file', {
+          session_file: { session_id: 'X', file_id: 'sf-no-convo', filename: 'noc.csv' },
+        });
+      });
+
+      expect(result.current.pathStatusByFileId['no-convo']).toEqual({
+        inline: { state: 'loaded', chars: 5 },
+      });
+      expect(result.current.sessionFiles).toEqual([
+        { session_id: 'X', file_id: 'sf-no-convo', filename: 'noc.csv' },
+      ]);
+    });
+
+    it('iter-3 regression — undefined and null normalize equal under scope-key', () => {
+      // Defensive: callers may pass `null` explicitly later (e.g. after
+      // a loadConvo failure). Both forms must compare equal under the
+      // normalize. The rerender re-opens the SSE (deps include raw
+      // conversationId, so React sees undefined → null as a change), so
+      // the freshly-opened MockSSE is the last entry in sseInstances.
+      const { result, rerender } = renderHook(
+        ({ cid }: { cid: string | null | undefined }) =>
+          useFileStatusStream({ enabled: true, conversationId: cid }),
+        { initialProps: { cid: undefined as string | null | undefined } },
+      );
+
+      rerender({ cid: null });
+
+      const latest = sseInstances[sseInstances.length - 1];
+      act(() => {
+        latest.dispatch('status', {
+          file_id: 'after-null',
+          path: 'rag',
+          state: 'embedded',
+          chunks: 4,
+        });
+      });
+
+      expect(result.current.pathStatusByFileId['after-null']).toEqual({
+        rag: { state: 'embedded', chunks: 4 },
+      });
+    });
   });
 });
