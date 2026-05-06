@@ -2,6 +2,7 @@ import type { TFile } from 'librechat-data-provider';
 import type { ExtendedFile } from '~/common';
 import { getFileType, cn } from '~/utils';
 import FilePreview from './FilePreview';
+import FileStatusChip, { PathStatus } from './FileStatusChip';
 import RemoveFile from './RemoveFile';
 
 const FileContainer = ({
@@ -11,6 +12,7 @@ const FileContainer = ({
   containerClassName,
   onDelete,
   onClick,
+  pathStatus,
 }: {
   file: Partial<ExtendedFile | TFile>;
   overrideType?: string;
@@ -18,8 +20,18 @@ const FileContainer = ({
   containerClassName?: string;
   onDelete?: () => void;
   onClick?: React.MouseEventHandler<HTMLButtonElement>;
+  pathStatus?: PathStatus | null;
 }) => {
   const fileType = getFileType(overrideType ?? file.type);
+  // Phase 2: prefer live SSE status when present, fall back to the value cached
+  // on the file row at upload-time (file.metadata.pathStatus). Pre-Phase-3 rows
+  // have neither — FileStatusChip handles undefined defensively.
+  const fileMetaPathStatus =
+    (file as { metadata?: { pathStatus?: PathStatus } } | undefined)?.metadata?.pathStatus;
+  const mergedPathStatus: PathStatus | null | undefined =
+    pathStatus != null
+      ? { ...(fileMetaPathStatus ?? {}), ...pathStatus }
+      : fileMetaPathStatus;
 
   return (
     <div
@@ -48,6 +60,11 @@ const FileContainer = ({
           </div>
         </div>
       </button>
+      {mergedPathStatus !== undefined && (
+        <div className="mt-1">
+          <FileStatusChip pathStatus={mergedPathStatus} />
+        </div>
+      )}
       {onDelete && <RemoveFile onRemove={onDelete} />}
     </div>
   );

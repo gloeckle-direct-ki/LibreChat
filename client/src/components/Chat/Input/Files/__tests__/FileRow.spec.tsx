@@ -15,6 +15,11 @@ jest.mock('~/data-provider', () => ({
 
 jest.mock('~/hooks/Files', () => ({
   useFileDeletion: jest.fn(),
+  useFileStatusStream: jest.fn(() => ({ pathStatusByFileId: {}, sessionFiles: [] })),
+}));
+
+jest.mock('~/Providers', () => ({
+  useChatContext: jest.fn(() => ({ conversation: null })),
 }));
 
 jest.mock('~/utils', () => ({

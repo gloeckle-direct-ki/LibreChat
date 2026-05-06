@@ -3,8 +3,10 @@ import { useToastContext } from '@librechat/client';
 import { EToolResources } from 'librechat-data-provider';
 import type { ExtendedFile } from '~/common';
 import { useDeleteFilesMutation } from '~/data-provider';
-import { useFileDeletion } from '~/hooks/Files';
+import { useFileDeletion, useFileStatusStream } from '~/hooks/Files';
+import { useChatContext } from '~/Providers';
 import FileContainer from './FileContainer';
+import SessionFileChip, { SessionFile } from './SessionFileChip';
 import { useLocalize } from '~/hooks';
 import { logger } from '~/utils';
 import Image from './Image';
@@ -34,9 +36,25 @@ export default function FileRow({
 }) {
   const localize = useLocalize();
   const { showToast } = useToastContext();
+  const { conversation } = useChatContext();
+  const conversationId = conversation?.conversationId ?? null;
+  // Phase 3 Track 2 wrote `Conversation.session_files` server-side. The type
+  // isn't surfaced on TConversation (data-provider), so we cast defensively.
+  const initialSessionFiles =
+    (conversation as { session_files?: SessionFile[] } | undefined | null)?.session_files ?? [];
+
   const files = Array.from(_files?.values() ?? []).filter((file) =>
     fileFilter ? fileFilter(file) : true,
   );
+
+  // Phase 2 — single SSE subscription per FileRow. Enabled when we have a
+  // conversation context (so server can scope events) and either uploaded
+  // files OR pre-existing session_files to track.
+  const { pathStatusByFileId, sessionFiles } = useFileStatusStream({
+    enabled: Boolean(conversationId) && (files.length > 0 || initialSessionFiles.length > 0),
+    conversationId,
+    initialSessionFiles,
+  });
 
   const { mutateAsync } = useDeleteFilesMutation({
     onMutate: async () =>
@@ -74,9 +92,24 @@ export default function FileRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files]);
 
-  if (files.length === 0) {
+  if (files.length === 0 && sessionFiles.length === 0) {
     return null;
   }
+
+  const renderSessionFiles = () => {
+    if (sessionFiles.length === 0) return null;
+    return (
+      <div
+        className="flex flex-wrap gap-1"
+        style={{ width: '100%', maxWidth: '100%', marginTop: '4px' }}
+        data-testid="session-files-row"
+      >
+        {sessionFiles.map((sf) => (
+          <SessionFileChip key={`${sf.session_id}-${sf.file_id}`} sessionFile={sf} />
+        ))}
+      </div>
+    );
+  };
 
   const renderFiles = () => {
     const rowStyle = isRTL
@@ -139,7 +172,11 @@ export default function FileRow({
                     source={file.source}
                   />
                 ) : (
-                  <FileContainer file={file} onDelete={handleDelete} />
+                  <FileContainer
+                    file={file}
+                    onDelete={handleDelete}
+                    pathStatus={pathStatusByFileId[file.file_id]}
+                  />
                 )}
               </div>
             );
@@ -148,9 +185,16 @@ export default function FileRow({
     );
   };
 
+  const content = (
+    <>
+      {files.length > 0 && renderFiles()}
+      {renderSessionFiles()}
+    </>
+  );
+
   if (Wrapper) {
-    return <Wrapper>{renderFiles()}</Wrapper>;
+    return <Wrapper>{content}</Wrapper>;
   }
 
-  return renderFiles();
+  return content;
 }
