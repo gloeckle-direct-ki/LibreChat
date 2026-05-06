@@ -57,6 +57,12 @@ export interface IConversation extends Document {
     filename: string;
     added_at?: Date;
   }>;
+  session_files?: Array<{
+    session_id: string;
+    file_id: string;
+    filename: string;
+    generated_at?: Date;
+  }>;
   expiredAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;

@@ -177,10 +177,50 @@ const registerFilesAsPersistent = async (conversationId, fileIds) => {
   }
 };
 
+/**
+ * Atomically registers a code-interpreter-generated file in
+ * Conversation.session_files. Idempotent on (session_id, file_id) tuple.
+ *
+ * Distinct from addPersistentFile: persistent_files tracks user-uploaded
+ * files (with db.files rows), session_files tracks exec-generated files
+ * (no db.files row required — they live in code-interpreter's session FS).
+ *
+ * @param {string} conversationId
+ * @param {{ session_id: string, file_id: string, filename: string }} entry
+ * @returns {Promise<import('mongoose').UpdateWriteOpResult>}
+ */
+const registerSessionFile = async (
+  conversationId,
+  { session_id, file_id, filename },
+) => {
+  try {
+    return await Conversation.updateOne(
+      {
+        conversationId,
+        session_files: { $not: { $elemMatch: { session_id, file_id } } },
+      },
+      {
+        $push: {
+          session_files: {
+            session_id,
+            file_id,
+            filename,
+            generated_at: new Date(),
+          },
+        },
+      },
+    );
+  } catch (error) {
+    logger.error('[registerSessionFile] Error registering session file', error);
+    throw new Error('Error registering session file');
+  }
+};
+
 module.exports = {
   getConvoFiles,
   addPersistentFile,
   registerFilesAsPersistent,
+  registerSessionFile,
   searchConversation,
   deleteNullOrEmptyConversations,
   /**

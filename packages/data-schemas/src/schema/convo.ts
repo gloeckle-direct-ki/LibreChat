@@ -45,6 +45,18 @@ const convoSchema: Schema<IConversation> = new Schema(
       ],
       default: [],
     },
+    session_files: {
+      type: [
+        {
+          session_id: { type: String, required: true },
+          file_id: { type: String, required: true },
+          filename: { type: String, required: true },
+          generated_at: { type: Date, default: Date.now },
+          _id: false,
+        },
+      ],
+      default: [],
+    },
     expiredAt: {
       type: Date,
     },
