@@ -69,6 +69,32 @@ const file: Schema<IMongoFile> = new Schema(
     height: Number,
     metadata: {
       fileIdentifier: String,
+      // Phase-2-shape, introduced in Phase 3 for the inline/rag pipeline state
+      // machine. Phase 2 will add SSE + UI on top, NOT a new schema.
+      extracted_text: String,
+      pathStatus: {
+        inline: {
+          state: String,
+          chars: Number,
+          reason: String,
+          completed_at: Date,
+          _id: false,
+        },
+        rag: {
+          state: String,
+          chunks: Number,
+          reason: String,
+          completed_at: Date,
+          _id: false,
+        },
+        mount: {
+          state: String,
+          reason: String,
+          completed_at: Date,
+          _id: false,
+        },
+        _id: false,
+      },
     },
     expiresAt: {
       type: Date,

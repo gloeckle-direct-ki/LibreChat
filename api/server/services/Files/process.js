@@ -35,6 +35,7 @@ const { getFileStrategy } = require('~/server/utils/getFileStrategy');
 const { checkCapability } = require('~/server/services/Config');
 const { LB_QueueAsyncCall } = require('~/server/utils/queue');
 const { getStrategyFunctions } = require('./strategies');
+const { runInlinePipeline } = require('./inlinePipeline');
 const { determineFileType } = require('~/server/utils');
 const { STTService } = require('./Audio/STTService');
 
@@ -490,6 +491,7 @@ const processFileUpload = async ({ req, res, metadata }) => {
     true,
   );
   await tryRegisterPersistentFile(metadata.conversationId, result);
+  await runInlinePipeline(file, result, metadata.conversationId);
   res.status(200).json({ message: 'File uploaded and processed successfully', ...result });
 };
 
@@ -585,6 +587,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
       }
       const result = await createFile(fileInfo, true);
       await tryRegisterPersistentFile(req.body?.conversationId, result);
+      await runInlinePipeline(file, result, req.body?.conversationId);
       return res
         .status(200)
         .json({ message: 'Agent file uploaded and processed successfully', ...result });
@@ -731,6 +734,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
 
   const result = await createFile(fileInfo, true);
   await tryRegisterPersistentFile(req.body?.conversationId, result);
+  await runInlinePipeline(file, result, req.body?.conversationId);
 
   res.status(200).json({ message: 'Agent file uploaded and processed successfully', ...result });
 };
