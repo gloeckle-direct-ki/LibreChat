@@ -65,14 +65,29 @@ export default function useFileStatusStream({
   const [liveSessionFiles, setLiveSessionFiles] = useState<SessionFile[]>([]);
   const sseRef = useRef<SSE | null>(null);
 
+  // codex polish-iter-2 (F2-bis): the in-effect reset still leaves one
+  // render where state belongs to the previous (conversationId, token)
+  // tuple — long enough to flash a stale chip after navigation. We track
+  // the scope synchronously in a ref and gate the *returned* values on
+  // a match, so the very first render of a new scope yields empty maps
+  // even before the effect's reset has flushed.
+  const scopeRef = useRef<{ conversationId: string | null | undefined; token: string | null }>(
+    { conversationId: null, token: null },
+  );
+  const scopeMatches =
+    scopeRef.current.conversationId === conversationId &&
+    scopeRef.current.token === token;
+
   useEffect(() => {
     // Fresh connection = fresh state. Prevents chips from one conversation
     // (or one logged-in user) bleeding into the next when this hook stays
     // mounted across navigation (codex review F2). React bails out of
     // re-renders when setState is called with the same empty-shape value,
-    // so the no-op case (initial mount) is free.
+    // so the no-op case (initial mount) is free. Updating scopeRef here
+    // (post-reset) is what flips `scopeMatches` true on the next render.
     setPathStatusByFileId({});
     setLiveSessionFiles([]);
+    scopeRef.current = { conversationId: conversationId ?? null, token: token ?? null };
 
     if (!enabled || !isAuthenticated || !token) return;
 
@@ -149,9 +164,15 @@ export default function useFileStatusStream({
 
   // Merge initial (server-rendered) session_files with live SSE updates.
   // Live entries take precedence on (session_id, file_id) collision since
-  // they reflect the most recent register.
+  // they reflect the most recent register. When the synchronous scope
+  // guard reports a mismatch (just changed conversationId/token), drop the
+  // live entries so this render shows initialSessionFiles only — no
+  // bleeding from the previous scope.
   const sessionFiles = useMemo(() => {
     const merged = [...(initialSessionFiles ?? [])];
+    if (!scopeMatches) {
+      return merged;
+    }
     const seen = new Set(merged.map((s) => `${s.session_id}::${s.file_id}`));
     for (const live of liveSessionFiles) {
       const key = `${live.session_id}::${live.file_id}`;
@@ -161,7 +182,13 @@ export default function useFileStatusStream({
       }
     }
     return merged;
-  }, [initialSessionFiles, liveSessionFiles]);
+  }, [initialSessionFiles, liveSessionFiles, scopeMatches]);
 
-  return { pathStatusByFileId, sessionFiles };
+  return {
+    // Return empty pathStatus on a stale-scope render so chips don't briefly
+    // carry data from the previous conversationId/token before the effect's
+    // reset flushes (codex F2-bis).
+    pathStatusByFileId: scopeMatches ? pathStatusByFileId : {},
+    sessionFiles,
+  };
 }

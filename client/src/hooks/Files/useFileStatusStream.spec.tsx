@@ -297,4 +297,73 @@ describe('useFileStatusStream', () => {
       expect(result.current.pathStatusByFileId['f1']).toBeDefined();
     });
   });
+
+  // Codex polish-iter-2 review F2-bis — the in-effect reset still leaves one
+  // render where the previous scope's state is exposed. Captures every render
+  // via a probe component and asserts no render under the new scope ever sees
+  // data that belonged to the old scope.
+  describe('synchronous scope guard (codex F2-bis)', () => {
+    function captureRenders() {
+      const observed: Array<{
+        cid: string | null | undefined;
+        pathStatus: Record<string, unknown>;
+        sessionFiles: number;
+      }> = [];
+      const Probe: React.FC<{ cid: string }> = ({ cid }) => {
+        const { pathStatusByFileId, sessionFiles } = useFileStatusStream({
+          enabled: true,
+          conversationId: cid,
+        });
+        observed.push({
+          cid,
+          pathStatus: { ...pathStatusByFileId },
+          sessionFiles: sessionFiles.length,
+        });
+        return null;
+      };
+      return { observed, Probe };
+    }
+
+    it('never exposes prev-scope pathStatus under a new conversationId', async () => {
+      const { render, act: actRTL } = await import('@testing-library/react');
+      const { observed, Probe } = captureRenders();
+
+      const { rerender } = render(<Probe cid="c1" />);
+      actRTL(() => {
+        sseInstances[0].dispatch('status', {
+          file_id: 'f-old',
+          path: 'inline',
+          state: 'loaded',
+          chars: 99,
+        });
+      });
+
+      rerender(<Probe cid="c2" />);
+
+      const violations = observed.filter(
+        (o) => o.cid === 'c2' && (o.pathStatus as Record<string, unknown>)['f-old'] !== undefined,
+      );
+      expect(violations).toEqual([]);
+    });
+
+    it('never exposes prev-scope sessionFiles under a new conversationId', async () => {
+      const { render, act: actRTL } = await import('@testing-library/react');
+      const { observed, Probe } = captureRenders();
+
+      const { rerender } = render(<Probe cid="c1" />);
+      actRTL(() => {
+        sseInstances[0].dispatch('session_file', {
+          session_file: { session_id: 'A', file_id: 'sf-old', filename: 'old.csv' },
+        });
+      });
+
+      rerender(<Probe cid="c2" />);
+
+      // c2 should never see a sessionFiles entry that came from the c1 scope.
+      // (initialSessionFiles is unspecified here, so the only source is the
+      // live event dispatched under c1.)
+      const violations = observed.filter((o) => o.cid === 'c2' && o.sessionFiles > 0);
+      expect(violations).toEqual([]);
+    });
+  });
 });
