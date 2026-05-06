@@ -1,6 +1,7 @@
 const { logger } = require('@librechat/data-schemas');
 const { routeFile } = require('./routing');
 const { embedToRag } = require('./VectorDB/embedToRag');
+const { emitStatusUpdate } = require('./statusBus');
 
 /**
  * Phase 3 Task 4 — runs the RAG pipeline for one freshly uploaded file.
@@ -48,6 +49,15 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id) 
       'metadata.pathStatus.rag.reason': reason,
       'metadata.pathStatus.rag.completed_at': new Date(),
     });
+    safeEmit({
+      file_id,
+      filename: fileResult.filename,
+      conversationId,
+      userId: req && req.user && req.user.id,
+      path: 'rag',
+      state: 'failed',
+      reason,
+    });
     if (conversationId) {
       try {
         const { recordFilePathFailure } = require('~/models/FilePathFailure');
@@ -82,6 +92,30 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id) 
       'rag-api returned embedded=false (unsupported MIME or known_type=false)';
   }
   await safeUpdateFile(update);
+
+  const emitState = result && result.embedded ? 'embedded' : 'failed';
+  safeEmit({
+    file_id,
+    filename: fileResult.filename,
+    conversationId,
+    userId: req && req.user && req.user.id,
+    path: 'rag',
+    state: emitState,
+    ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
+    ...(emitState === 'failed'
+      ? {
+          reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
+        }
+      : {}),
+  });
+}
+
+function safeEmit(event) {
+  try {
+    emitStatusUpdate({ ...event, timestamp: new Date().toISOString() });
+  } catch (err) {
+    logger.warn(`[runRagPipeline] emit failed: ${err && err.message}`);
+  }
 }
 
 async function safeUpdateFile(data) {

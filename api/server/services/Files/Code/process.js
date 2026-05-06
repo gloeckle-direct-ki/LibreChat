@@ -17,6 +17,7 @@ const { convertImage } = require('~/server/services/Files/images/convert');
 const { createFile, getFiles, updateFile } = require('~/models');
 const { Conversation } = require('~/db/models');
 const { registerSessionFile } = require('~/models/Conversation');
+const { emitSessionFileUpdate } = require('~/server/services/Files/statusBus');
 
 /**
  * Process OpenAI image files, convert to target format, save and return file metadata.
@@ -49,11 +50,26 @@ const processCodeOutput = async ({
   const userId = req?.user?.id;
   if (conversationId && session_id && id && name && userId) {
     try {
-      await registerSessionFile(conversationId, userId, {
+      const result = await registerSessionFile(conversationId, userId, {
         session_id,
         file_id: id,
         filename: name,
       });
+      // Phase 2 — only emit when the write actually landed (matched a convo).
+      // Skips no-op cross-user-injection cases that registerSessionFile
+      // silently rejects (matchedCount === 0).
+      if (result && result.matchedCount > 0) {
+        try {
+          emitSessionFileUpdate({
+            conversationId,
+            userId,
+            session_file: { session_id, file_id: id, filename: name },
+            timestamp: new Date().toISOString(),
+          });
+        } catch (emitErr) {
+          logger.warn(`[processCodeOutput] emitSessionFileUpdate failed: ${emitErr.message}`);
+        }
+      }
     } catch (err) {
       logger.warn(`[processCodeOutput] registerSessionFile failed: ${err.message}`);
     }

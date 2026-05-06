@@ -1,6 +1,7 @@
 const { logger } = require('@librechat/data-schemas');
 const { routeFile } = require('./routing');
 const { extractInlineText } = require('./inlineExtract');
+const { emitStatusUpdate } = require('./statusBus');
 
 /**
  * Phase 3 Task 3 — runs the inline pipeline for one freshly uploaded file.
@@ -52,6 +53,15 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
       'metadata.pathStatus.inline.reason': reason,
       'metadata.pathStatus.inline.completed_at': new Date(),
     });
+    safeEmit({
+      file_id,
+      filename,
+      conversationId,
+      userId: req && req.user && req.user.id,
+      path: 'inline',
+      state: 'failed',
+      reason,
+    });
     if (conversationId) {
       try {
         const { recordFilePathFailure } = require('~/models/FilePathFailure');
@@ -79,6 +89,23 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
     'metadata.pathStatus.inline.chars': extracted.chars,
     'metadata.pathStatus.inline.completed_at': new Date(),
   });
+  safeEmit({
+    file_id,
+    filename,
+    conversationId,
+    userId: req && req.user && req.user.id,
+    path: 'inline',
+    state: 'loaded',
+    chars: extracted.chars,
+  });
+}
+
+function safeEmit(event) {
+  try {
+    emitStatusUpdate({ ...event, timestamp: new Date().toISOString() });
+  } catch (err) {
+    logger.warn(`[runInlinePipeline] emit failed: ${err && err.message}`);
+  }
 }
 
 async function safeUpdateFile(data) {
