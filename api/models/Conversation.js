@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const { logger } = require('@librechat/data-schemas');
 const { createTempChatExpirationDate } = require('@librechat/api');
 const { getMessages, deleteMessages } = require('./Message');
@@ -109,9 +110,59 @@ const addPersistentFile = async (conversationId, { file_id, filename }) => {
   }
 };
 
+/**
+ * Registers a list of file_ids in Conversation.persistent_files.
+ *
+ * The upload-handler hook in api/server/services/Files/process.js cannot
+ * register here on its own because the LibreChat frontend doesn't include
+ * conversationId in the multipart upload body — every file row enters
+ * db.files with conversationId:undefined. This helper closes the gap by
+ * running at saveConvo time, where conversationId AND the full files[]
+ * array are both definitively known.
+ *
+ * Best-effort: per-file failures are logged and swallowed so a single bad
+ * file_id can't break the entire conversation save. Idempotent: re-running
+ * with the same file_ids leaves persistent_files unchanged (addPersistentFile
+ * uses a $ne-conditional $push).
+ *
+ * @param {string|null|undefined} conversationId
+ * @param {string[]|null|undefined} fileIds
+ * @returns {Promise<void>}
+ */
+const registerFilesAsPersistent = async (conversationId, fileIds) => {
+  if (!conversationId || !Array.isArray(fileIds) || fileIds.length === 0) {
+    return;
+  }
+  try {
+    const File = mongoose.model('File');
+    const fileDocs = await File.find(
+      { file_id: { $in: fileIds } },
+      { file_id: 1, filename: 1 },
+    ).lean();
+    for (const fileDoc of fileDocs) {
+      if (!fileDoc.filename) {
+        continue;
+      }
+      try {
+        await addPersistentFile(conversationId, {
+          file_id: fileDoc.file_id,
+          filename: fileDoc.filename,
+        });
+      } catch (err) {
+        logger.warn(
+          `[registerFilesAsPersistent] failed for ${fileDoc.file_id}: ${err.message}`,
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn(`[registerFilesAsPersistent] lookup failed: ${err.message}`);
+  }
+};
+
 module.exports = {
   getConvoFiles,
   addPersistentFile,
+  registerFilesAsPersistent,
   searchConversation,
   deleteNullOrEmptyConversations,
   /**
@@ -162,6 +213,14 @@ module.exports = {
           upsert: true,
         },
       );
+
+      // Phase-1.5: register top-level files in Conversation.persistent_files.
+      // The upload-handler hook in process.js cannot do this because the
+      // frontend omits conversationId in the multipart upload body. saveConvo
+      // is the first place where conversationId AND the full files[] array
+      // are both reliably known, so we backstop the registration here.
+      // Best-effort and idempotent — see registerFilesAsPersistent docs.
+      await registerFilesAsPersistent(conversation.conversationId, update.files);
 
       return conversation.toObject();
     } catch (error) {
