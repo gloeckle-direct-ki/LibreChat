@@ -2,7 +2,7 @@ jest.mock('@librechat/data-schemas', () => ({
   logger: { warn: jest.fn(), debug: jest.fn(), info: jest.fn(), error: jest.fn() },
 }));
 
-const { statusStreamHandler } = require('./statusStream');
+const { statusStreamHandler, HEARTBEAT_INTERVAL_MS } = require('./statusStream');
 const {
   statusBus,
   emitStatusUpdate,
@@ -192,5 +192,79 @@ describe('GET /api/files/status-stream', () => {
     statusStreamHandler(req, res);
 
     expect(res.status).toHaveBeenCalledWith(401);
+  });
+
+  describe('heartbeat (codex F1 — idle SSE proxy timeout)', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('emits a keepalive comment after the heartbeat interval', () => {
+      const req = makeReq('u1');
+      const res = makeRes();
+      statusStreamHandler(req, res);
+      // Drop the initial `: connected ...` write so we can assert the
+      // heartbeat write in isolation.
+      res.writes.length = 0;
+
+      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS + 100);
+
+      expect(res.writes.join('')).toMatch(/^:\s*heartbeat\n\n/);
+    });
+
+    it('emits multiple heartbeats while the connection is open', () => {
+      const req = makeReq('u1');
+      const res = makeRes();
+      statusStreamHandler(req, res);
+      res.writes.length = 0;
+
+      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS * 3 + 200);
+
+      const heartbeatCount = res.writes.filter((w) => w.includes('heartbeat')).length;
+      expect(heartbeatCount).toBe(3);
+    });
+
+    it('clears the heartbeat interval on cleanup (no leak after disconnect)', () => {
+      const req = makeReq('u1');
+      const res = makeRes();
+      statusStreamHandler(req, res);
+
+      req._trigger('close');
+      res.writes.length = 0;
+
+      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS * 5);
+
+      expect(res.writes.length).toBe(0);
+    });
+
+    it('clears the heartbeat interval on req aborted as well', () => {
+      const req = makeReq('u1');
+      const res = makeRes();
+      statusStreamHandler(req, res);
+
+      req._trigger('aborted');
+      res.writes.length = 0;
+
+      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS * 2);
+
+      expect(res.writes.length).toBe(0);
+    });
+
+    it('stops writing heartbeats once the response has ended', () => {
+      const req = makeReq('u1');
+      const res = makeRes();
+      statusStreamHandler(req, res);
+      res.writableEnded = true;
+      res.writes.length = 0;
+
+      jest.advanceTimersByTime(HEARTBEAT_INTERVAL_MS + 100);
+
+      // safeWrite is a no-op when writableEnded; the interval still ticks
+      // but produces no output.
+      expect(res.writes.length).toBe(0);
+    });
   });
 });

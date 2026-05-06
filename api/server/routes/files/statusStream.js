@@ -1,6 +1,11 @@
 const { logger } = require('@librechat/data-schemas');
 const { statusBus } = require('~/server/services/Files/statusBus');
 
+// Most reverse-proxy/load-balancer setups close idle SSE responses after
+// 30–60s. We send a comment line every 25s to keep the response active —
+// shorter than the typical 30s nginx default, leaving headroom for jitter.
+const HEARTBEAT_INTERVAL_MS = 25_000;
+
 /**
  * Phase 2 — SSE handler for file-status updates.
  *
@@ -14,9 +19,15 @@ const { statusBus } = require('~/server/services/Files/statusBus');
  *   - `event: session_file\ndata: { conversationId, userId, session_file:
  *     { session_id, file_id, filename, generated_at }, timestamp }\n\n`
  *
+ * Idle keepalive: emits `: heartbeat\n\n` every HEARTBEAT_INTERVAL_MS to keep
+ * the response unbuffered through long idle gaps (large OCR/RAG runs may
+ * exceed the proxy idle timeout). The bus has no replay, so a connection
+ * that gets force-closed by a proxy and reconnects can miss events emitted
+ * during the reconnect window — keep the connection alive instead.
+ *
  * Listener cleanup happens on `req.on('close')` — required to avoid leaking
  * listeners on the bus when clients disconnect (browser tab close,
- * EventSource.close()).
+ * EventSource.close()). The heartbeat interval is cleared in the same path.
  *
  * Auth: relies on the parent router's `requireJwtAuth` middleware to populate
  * `req.user`. Defensive 401 if missing — never trust the absence of middleware.
@@ -63,7 +74,15 @@ function statusStreamHandler(req, res) {
   statusBus.on('status', onStatus);
   statusBus.on('session_file', onSessionFile);
 
+  const heartbeat = setInterval(() => {
+    safeWrite(res, ': heartbeat\n\n');
+  }, HEARTBEAT_INTERVAL_MS);
+  // Don't keep the Node event loop alive solely on this interval (e.g. during
+  // graceful shutdown) — let `req.close` drive cleanup as the source of truth.
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
+
   const cleanup = () => {
+    clearInterval(heartbeat);
     statusBus.off('status', onStatus);
     statusBus.off('session_file', onSessionFile);
   };
@@ -81,4 +100,4 @@ function safeWrite(res, chunk) {
   }
 }
 
-module.exports = { statusStreamHandler };
+module.exports = { statusStreamHandler, HEARTBEAT_INTERVAL_MS };

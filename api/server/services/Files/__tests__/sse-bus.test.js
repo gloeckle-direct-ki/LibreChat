@@ -71,6 +71,7 @@ const { runRagPipeline } = require('../ragPipeline');
 const { processCodeOutput } = require('../Code/process');
 const { extractInlineText } = require('../inlineExtract');
 const { embedToRag } = require('../VectorDB/embedToRag');
+const fileModelMock = require('~/models/File');
 const { registerSessionFile } = require('~/models/Conversation');
 
 describe('SSE bus emits from Phase-3 pipelines', () => {
@@ -82,6 +83,9 @@ describe('SSE bus emits from Phase-3 pipelines', () => {
     statusBus.on('status', (e) => emitted.status.push(e));
     statusBus.on('session_file', (e) => emitted.session_file.push(e));
     jest.clearAllMocks();
+    // Reset the default updateFile success-path between tests; the F3 / F4
+    // cases below override per-test with mockResolvedValueOnce / mockRejectedValueOnce.
+    fileModelMock.updateFile.mockResolvedValue({ file_id: 'persisted' });
   });
 
   describe('inlinePipeline', () => {
@@ -124,6 +128,25 @@ describe('SSE bus emits from Phase-3 pipelines', () => {
     it('does not emit when route decision skips inline (size > threshold)', async () => {
       const largeFile = { ...file, size: 100_000 };
       await runInlinePipeline({ user: { id: 'u1' } }, largeFile, fileResult, 'conv-1');
+      expect(emitted.status).toHaveLength(0);
+    });
+
+    // Codex review F3 — emit must be gated on a persisted update.
+    it('does not emit on inline/loaded when updateFile returns null (file row vanished)', async () => {
+      extractInlineText.mockResolvedValue({ text: 'Hi', chars: 2, filename: 'x.pdf' });
+      fileModelMock.updateFile.mockResolvedValueOnce(null);
+
+      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
+
+      expect(emitted.status).toHaveLength(0);
+    });
+
+    it('does not emit on inline/failed when updateFile rejects (DB unreachable)', async () => {
+      extractInlineText.mockRejectedValue(new Error('PDF encrypted'));
+      fileModelMock.updateFile.mockRejectedValueOnce(new Error('Mongo down'));
+
+      await runInlinePipeline({ user: { id: 'u1' } }, file, fileResult, 'conv-1');
+
       expect(emitted.status).toHaveLength(0);
     });
   });
@@ -173,6 +196,25 @@ describe('SSE bus emits from Phase-3 pipelines', () => {
         state: 'failed',
         reason: expect.stringMatching(/embedded=false/),
       });
+    });
+
+    // Codex review F4 — emit must be gated on a persisted update.
+    it('does not emit on rag/embedded when updateFile returns null (file row vanished)', async () => {
+      embedToRag.mockResolvedValue({ embedded: true, chunks: 7 });
+      fileModelMock.updateFile.mockResolvedValueOnce(null);
+
+      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
+
+      expect(emitted.status).toHaveLength(0);
+    });
+
+    it('does not emit on rag/failed when updateFile rejects (DB unreachable)', async () => {
+      embedToRag.mockRejectedValue(new Error('rag-api 502'));
+      fileModelMock.updateFile.mockRejectedValueOnce(new Error('Mongo down'));
+
+      await runRagPipeline({ user: { id: 'u2' } }, file, fileResult, 'conv-2');
+
+      expect(emitted.status).toHaveLength(0);
     });
   });
 

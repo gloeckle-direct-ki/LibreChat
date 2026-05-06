@@ -43,21 +43,23 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id) 
   } catch (err) {
     const reason = err && err.message ? err.message : String(err);
     logger.warn(`[runRagPipeline] embed failed for ${file_id}: ${reason}`);
-    await safeUpdateFile({
+    const persisted = await safeUpdateFile({
       file_id,
       'metadata.pathStatus.rag.state': 'failed',
       'metadata.pathStatus.rag.reason': reason,
       'metadata.pathStatus.rag.completed_at': new Date(),
     });
-    safeEmit({
-      file_id,
-      filename: fileResult.filename,
-      conversationId,
-      userId: req && req.user && req.user.id,
-      path: 'rag',
-      state: 'failed',
-      reason,
-    });
+    if (persisted) {
+      safeEmit({
+        file_id,
+        filename: fileResult.filename,
+        conversationId,
+        userId: req && req.user && req.user.id,
+        path: 'rag',
+        state: 'failed',
+        reason,
+      });
+    }
     if (conversationId) {
       try {
         const { recordFilePathFailure } = require('~/models/FilePathFailure');
@@ -91,23 +93,25 @@ async function runRagPipeline(req, file, fileResult, conversationId, entity_id) 
     update['metadata.pathStatus.rag.reason'] =
       'rag-api returned embedded=false (unsupported MIME or known_type=false)';
   }
-  await safeUpdateFile(update);
+  const persisted = await safeUpdateFile(update);
 
-  const emitState = result && result.embedded ? 'embedded' : 'failed';
-  safeEmit({
-    file_id,
-    filename: fileResult.filename,
-    conversationId,
-    userId: req && req.user && req.user.id,
-    path: 'rag',
-    state: emitState,
-    ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
-    ...(emitState === 'failed'
-      ? {
-          reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
-        }
-      : {}),
-  });
+  if (persisted) {
+    const emitState = result && result.embedded ? 'embedded' : 'failed';
+    safeEmit({
+      file_id,
+      filename: fileResult.filename,
+      conversationId,
+      userId: req && req.user && req.user.id,
+      path: 'rag',
+      state: emitState,
+      ...(typeof (result && result.chunks) === 'number' ? { chunks: result.chunks } : {}),
+      ...(emitState === 'failed'
+        ? {
+            reason: 'rag-api returned embedded=false (unsupported MIME or known_type=false)',
+          }
+        : {}),
+    });
+  }
 }
 
 function safeEmit(event) {
@@ -118,14 +122,18 @@ function safeEmit(event) {
   }
 }
 
+// Returns the updated File doc on success, or null when the row does not
+// exist or the write failed. Callers gate `safeEmit` on the truthy result so
+// we never broadcast a state change the DB doesn't reflect (Codex review F4).
 async function safeUpdateFile(data) {
   try {
     const { updateFile } = require('~/models/File');
-    await updateFile(data);
+    return (await updateFile(data)) || null;
   } catch (err) {
     logger.warn(
       `[runRagPipeline] updateFile failed for ${data.file_id}: ${err && err.message}`,
     );
+    return null;
   }
 }
 

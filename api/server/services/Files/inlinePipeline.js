@@ -47,21 +47,23 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
   } catch (err) {
     const reason = err && err.message ? err.message : String(err);
     logger.warn(`[runInlinePipeline] extract failed for ${file_id}: ${reason}`);
-    await safeUpdateFile({
+    const persisted = await safeUpdateFile({
       file_id,
       'metadata.pathStatus.inline.state': 'failed',
       'metadata.pathStatus.inline.reason': reason,
       'metadata.pathStatus.inline.completed_at': new Date(),
     });
-    safeEmit({
-      file_id,
-      filename,
-      conversationId,
-      userId: req && req.user && req.user.id,
-      path: 'inline',
-      state: 'failed',
-      reason,
-    });
+    if (persisted) {
+      safeEmit({
+        file_id,
+        filename,
+        conversationId,
+        userId: req && req.user && req.user.id,
+        path: 'inline',
+        state: 'failed',
+        reason,
+      });
+    }
     if (conversationId) {
       try {
         const { recordFilePathFailure } = require('~/models/FilePathFailure');
@@ -82,22 +84,24 @@ async function runInlinePipeline(req, file, fileResult, conversationId) {
     return;
   }
 
-  await safeUpdateFile({
+  const persisted = await safeUpdateFile({
     file_id,
     'metadata.extracted_text': extracted.text,
     'metadata.pathStatus.inline.state': 'loaded',
     'metadata.pathStatus.inline.chars': extracted.chars,
     'metadata.pathStatus.inline.completed_at': new Date(),
   });
-  safeEmit({
-    file_id,
-    filename,
-    conversationId,
-    userId: req && req.user && req.user.id,
-    path: 'inline',
-    state: 'loaded',
-    chars: extracted.chars,
-  });
+  if (persisted) {
+    safeEmit({
+      file_id,
+      filename,
+      conversationId,
+      userId: req && req.user && req.user.id,
+      path: 'inline',
+      state: 'loaded',
+      chars: extracted.chars,
+    });
+  }
 }
 
 function safeEmit(event) {
@@ -108,14 +112,18 @@ function safeEmit(event) {
   }
 }
 
+// Returns the updated File doc on success, or null when the row does not
+// exist or the write failed. Callers gate `safeEmit` on the truthy result so
+// we never broadcast a state change the DB doesn't reflect (Codex review F3).
 async function safeUpdateFile(data) {
   try {
     const { updateFile } = require('~/models/File');
-    await updateFile(data);
+    return (await updateFile(data)) || null;
   } catch (err) {
     logger.warn(
       `[runInlinePipeline] updateFile failed for ${data.file_id}: ${err && err.message}`,
     );
+    return null;
   }
 }
 
