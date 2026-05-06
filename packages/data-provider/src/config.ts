@@ -280,6 +280,9 @@ export const agentsEndpointSchema = baseEndpointSchema
       maxCitations: z.number().min(1).max(50).optional().default(30),
       maxCitationsPerFile: z.number().min(1).max(10).optional().default(7),
       minRelevanceScore: z.number().min(0.0).max(1.0).optional().default(0.45),
+      // Phase 3 Task 7 — string prepended to every agent's system prompt.
+      // Used for citation-format hints and similar cross-agent guidance.
+      additionalSystemPromptPrefix: z.string().optional(),
       allowedProviders: z.array(z.union([z.string(), eModelEndpointSchema])).optional(),
       capabilities: z
         .array(z.nativeEnum(AgentCapabilities))

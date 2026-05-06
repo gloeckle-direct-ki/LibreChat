@@ -479,6 +479,17 @@ async function loadAgentTools({
     imageOutputType: appConfig.imageOutputType,
   });
 
+  // Phase 3 Task 7 — system-prompt prefix (e.g. citation-format guidance)
+  // configured at endpoints.agents.additionalSystemPromptPrefix in
+  // librechat.yaml. Empty/missing string is a no-op. Sits before
+  // __inline_files so the LLM reads "cite as [Quelle: <name>]" before
+  // seeing the inline file blocks themselves.
+  const systemPromptPrefix =
+    appConfig?.endpoints?.[EModelEndpoint.agents]?.additionalSystemPromptPrefix;
+  if (typeof systemPromptPrefix === 'string' && systemPromptPrefix.trim().length > 0) {
+    toolContextMap.__system_prompt_prefix = systemPromptPrefix;
+  }
+
   // Phase 3 Task 5 — inject inline-extracted file content into the system
   // message via toolContextMap. run.ts joins all toolContextMap values into
   // the system prompt; an extra non-tool key rides along that join cleanly.

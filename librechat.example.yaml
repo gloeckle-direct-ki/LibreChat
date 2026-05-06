@@ -268,6 +268,12 @@ endpoints:
   #   minRelevanceScore: 0.45
   #   # (optional) Agent Capabilities available to all users. Omit the ones you wish to exclude. Defaults to list below.
   #   capabilities: ["execute_code", "file_search", "actions", "tools"]
+  #   # (optional) String prepended to every agent's system prompt. Used for
+  #   # citation-format hints and similar cross-agent guidance. Phase 3 Task 7.
+  #   additionalSystemPromptPrefix: |
+  #     Wenn du dich auf Inhalte aus einer Wissensbasis-Suche oder einer
+  #     Datei-Inline-Quelle beziehst, gib das Format an: [Quelle: <filename>]
+  #     bzw. [Quelle: <filename>, Treffer X]. Halluziniere keine Datei-Quellen.
 
   # Anthropic endpoint configuration with Vertex AI support
   # Use this to run Anthropic Claude models through Google Cloud Vertex AI
